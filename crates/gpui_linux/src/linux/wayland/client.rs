@@ -2428,7 +2428,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
 
                             let input = PlatformInput::FileDrop(FileDropEvent::Entered {
                                 position,
-                                paths: gpui::ExternalPaths(paths),
+                                paths: gpui::ExternalPaths::new(paths),
                             });
 
                             let client = this.get_client();

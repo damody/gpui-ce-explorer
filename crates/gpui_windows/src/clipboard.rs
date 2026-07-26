@@ -263,7 +263,7 @@ fn read_files() -> Option<ClipboardEntry> {
     let hdrop = HDROP(locked.ptr as *mut _);
     let mut filenames = Vec::new();
     with_file_names(hdrop, |name| filenames.push(std::path::PathBuf::from(name)));
-    Some(ClipboardEntry::ExternalPaths(ExternalPaths(
+    Some(ClipboardEntry::ExternalPaths(ExternalPaths::new(
         filenames.into(),
     )))
 }

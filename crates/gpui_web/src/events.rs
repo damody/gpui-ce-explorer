@@ -312,7 +312,7 @@ impl WebWindowInner {
 
             this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Entered {
                 position,
-                paths: ExternalPaths(paths),
+                paths: ExternalPaths::new(paths),
             }));
 
             this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Submit { position }));

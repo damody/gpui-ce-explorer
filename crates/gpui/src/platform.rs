@@ -1943,7 +1943,7 @@ impl ClipboardItem {
         if answer.is_empty() {
             for entry in self.entries.iter() {
                 if let ClipboardEntry::ExternalPaths(paths) = entry {
-                    for path in &paths.0 {
+                    for path in paths.paths() {
                         use std::fmt::Write as _;
                         _ = write!(answer, "{}", path.display());
                     }

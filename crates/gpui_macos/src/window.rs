@@ -2806,7 +2806,7 @@ fn external_paths_from_event(dragging_info: *mut Object) -> Option<ExternalPaths
         };
         paths.push(PathBuf::from(path))
     }
-    Some(ExternalPaths(paths))
+    Some(ExternalPaths::new(paths))
 }
 
 extern "C" fn conclude_drag_operation(this: &Object, _: Sel, _: id) {

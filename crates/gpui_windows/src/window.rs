@@ -21,7 +21,13 @@ use windows::{
         Graphics::Dwm::*,
         Graphics::Gdi::*,
         System::{
-            Com::*, Diagnostics::Debug::MessageBeep, LibraryLoader::*, Ole::*, SystemServices::*,
+            Com::*,
+            DataExchange::RegisterClipboardFormatW,
+            Diagnostics::Debug::MessageBeep,
+            LibraryLoader::*,
+            Memory::{GlobalLock, GlobalUnlock},
+            Ole::*,
+            SystemServices::*,
         },
         UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
@@ -1174,14 +1180,110 @@ impl accesskit::ActionHandler for A11yActionHandler {
 }
 
 #[implement(IDropTarget)]
-struct WindowsDragDropHandler(pub Rc<WindowsWindowInner>);
+struct WindowsDragDropHandler {
+    window: Rc<WindowsWindowInner>,
+    active_paths: RefCell<Option<ExternalPaths>>,
+    preferred: Cell<ExternalDropEffect>,
+}
 
 impl WindowsDragDropHandler {
     fn handle_drag_drop(&self, input: PlatformInput) {
-        if let Some(mut func) = self.0.state.callbacks.input.take() {
+        if let Some(mut func) = self.window.state.callbacks.input.take() {
             func(input);
-            self.0.state.callbacks.input.set(Some(func));
+            self.window.state.callbacks.input.set(Some(func));
         }
+    }
+}
+
+fn external_effects(effect: DROPEFFECT) -> ExternalDropEffects {
+    ExternalDropEffects {
+        copy: effect.0 & DROPEFFECT_COPY.0 != 0,
+        move_item: effect.0 & DROPEFFECT_MOVE.0 != 0,
+        link: effect.0 & DROPEFFECT_LINK.0 != 0,
+    }
+}
+
+fn external_modifiers(state: MODIFIERKEYS_FLAGS) -> Modifiers {
+    Modifiers {
+        control: state.0 & MK_CONTROL.0 != 0,
+        shift: state.0 & MK_SHIFT.0 != 0,
+        alt: unsafe { GetKeyState(VK_MENU.0 as i32) } < 0,
+        ..Modifiers::default()
+    }
+}
+
+fn negotiate_external_effect(
+    allowed: ExternalDropEffects,
+    preferred: ExternalDropEffect,
+    modifiers: Modifiers,
+) -> ExternalDropEffect {
+    if modifiers.alt && allowed.link {
+        ExternalDropEffect::Link
+    } else if modifiers.control && allowed.copy {
+        ExternalDropEffect::Copy
+    } else if modifiers.shift && allowed.move_item {
+        ExternalDropEffect::Move
+    } else if matches!(preferred, ExternalDropEffect::Copy) && allowed.copy {
+        ExternalDropEffect::Copy
+    } else if matches!(preferred, ExternalDropEffect::Move) && allowed.move_item {
+        ExternalDropEffect::Move
+    } else if matches!(preferred, ExternalDropEffect::Link) && allowed.link {
+        ExternalDropEffect::Link
+    } else if allowed.copy {
+        ExternalDropEffect::Copy
+    } else if allowed.move_item {
+        ExternalDropEffect::Move
+    } else if allowed.link {
+        ExternalDropEffect::Link
+    } else {
+        ExternalDropEffect::None
+    }
+}
+
+fn native_external_effect(effect: ExternalDropEffect) -> DROPEFFECT {
+    match effect {
+        ExternalDropEffect::None => DROPEFFECT_NONE,
+        ExternalDropEffect::Copy => DROPEFFECT_COPY,
+        ExternalDropEffect::Move => DROPEFFECT_MOVE,
+        ExternalDropEffect::Link => DROPEFFECT_LINK,
+    }
+}
+
+fn preferred_external_effect(data: &IDataObject) -> ExternalDropEffect {
+    unsafe {
+        let format = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+        if format == 0 {
+            return ExternalDropEffect::None;
+        }
+        let config = FORMATETC {
+            cfFormat: format as u16,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        };
+        let Ok(mut medium) = data.GetData(&config) else {
+            return ExternalDropEffect::None;
+        };
+        let global = medium.u.hGlobal;
+        let pointer = GlobalLock(global);
+        let effect = if pointer.is_null() {
+            ExternalDropEffect::None
+        } else {
+            let native = DROPEFFECT(pointer.cast::<u32>().read_unaligned());
+            let _ = GlobalUnlock(global);
+            if native.0 & DROPEFFECT_MOVE.0 != 0 {
+                ExternalDropEffect::Move
+            } else if native.0 & DROPEFFECT_COPY.0 != 0 {
+                ExternalDropEffect::Copy
+            } else if native.0 & DROPEFFECT_LINK.0 != 0 {
+                ExternalDropEffect::Link
+            } else {
+                ExternalDropEffect::None
+            }
+        };
+        ReleaseStgMedium(&mut medium);
+        effect
     }
 }
 
@@ -1190,7 +1292,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     fn DragEnter(
         &self,
         pdataobj: windows::core::Ref<IDataObject>,
-        _grfkeystate: MODIFIERKEYS_FLAGS,
+        grfkeystate: MODIFIERKEYS_FLAGS,
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
@@ -1205,7 +1307,9 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             };
             let cursor_position = POINT { x: pt.x, y: pt.y };
             if idata_obj.QueryGetData(&config as _) == S_OK {
-                *pdweffect = DROPEFFECT_COPY;
+                let allowed = external_effects(*pdweffect);
+                let preferred = preferred_external_effect(idata_obj);
+                self.preferred.set(preferred);
                 let Some(mut idata) = idata_obj.GetData(&config as _).log_err() else {
                     return Ok(());
                 };
@@ -1221,25 +1325,39 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 });
                 ReleaseStgMedium(&mut idata);
                 let mut cursor_position = cursor_position;
-                ScreenToClient(self.0.hwnd, &mut cursor_position)
+                let metadata = ExternalDropMetadata {
+                    allowed,
+                    preferred,
+                    negotiated: negotiate_external_effect(
+                        allowed,
+                        preferred,
+                        external_modifiers(grfkeystate),
+                    ),
+                    modifiers: external_modifiers(grfkeystate),
+                    right_button: grfkeystate.0 & MK_RBUTTON.0 != 0,
+                };
+                let paths = ExternalPaths::with_metadata(paths, metadata);
+                *self.active_paths.borrow_mut() = Some(paths.clone());
+                ScreenToClient(self.window.hwnd, &mut cursor_position)
                     .ok()
                     .log_err();
-                let scale_factor = self.0.state.scale_factor.get();
+                let scale_factor = self.window.state.scale_factor.get();
                 let input = PlatformInput::FileDrop(FileDropEvent::Entered {
                     position: logical_point(
                         cursor_position.x as f32,
                         cursor_position.y as f32,
                         scale_factor,
                     ),
-                    paths: ExternalPaths(paths),
+                    paths: paths.clone(),
                 });
                 self.handle_drag_drop(input);
+                *pdweffect = native_external_effect(paths.drop_metadata().negotiated);
             } else {
                 *pdweffect = DROPEFFECT_NONE;
             }
-            self.0
+            self.window
                 .drop_target_helper
-                .DragEnter(self.0.hwnd, idata_obj, &cursor_position, *pdweffect)
+                .DragEnter(self.window.hwnd, idata_obj, &cursor_position, *pdweffect)
                 .log_err();
         }
         Ok(())
@@ -1247,22 +1365,28 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
 
     fn DragOver(
         &self,
-        _grfkeystate: MODIFIERKEYS_FLAGS,
+        grfkeystate: MODIFIERKEYS_FLAGS,
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
-            *pdweffect = DROPEFFECT_COPY;
-            self.0
-                .drop_target_helper
-                .DragOver(&cursor_position, *pdweffect)
-                .log_err();
-            ScreenToClient(self.0.hwnd, &mut cursor_position)
+            if let Some(paths) = self.active_paths.borrow().as_ref() {
+                let allowed = external_effects(*pdweffect);
+                let modifiers = external_modifiers(grfkeystate);
+                paths.update_drop_metadata(ExternalDropMetadata {
+                    allowed,
+                    preferred: self.preferred.get(),
+                    negotiated: negotiate_external_effect(allowed, self.preferred.get(), modifiers),
+                    modifiers,
+                    right_button: grfkeystate.0 & MK_RBUTTON.0 != 0,
+                });
+            }
+            ScreenToClient(self.window.hwnd, &mut cursor_position)
                 .ok()
                 .log_err();
         }
-        let scale_factor = self.0.state.scale_factor.get();
+        let scale_factor = self.window.state.scale_factor.get();
         let input = PlatformInput::FileDrop(FileDropEvent::Pending {
             position: logical_point(
                 cursor_position.x as f32,
@@ -1271,16 +1395,28 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             ),
         });
         self.handle_drag_drop(input);
+        unsafe {
+            if let Some(paths) = self.active_paths.borrow().as_ref() {
+                *pdweffect = native_external_effect(paths.drop_metadata().negotiated);
+            }
+        }
+        unsafe {
+            self.window
+                .drop_target_helper
+                .DragOver(&POINT { x: pt.x, y: pt.y }, *pdweffect)
+                .log_err();
+        }
 
         Ok(())
     }
 
     fn DragLeave(&self) -> windows::core::Result<()> {
         unsafe {
-            self.0.drop_target_helper.DragLeave().log_err();
+            self.window.drop_target_helper.DragLeave().log_err();
         }
         let input = PlatformInput::FileDrop(FileDropEvent::Exited);
         self.handle_drag_drop(input);
+        self.active_paths.borrow_mut().take();
 
         Ok(())
     }
@@ -1288,23 +1424,29 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     fn Drop(
         &self,
         pdataobj: windows::core::Ref<IDataObject>,
-        _grfkeystate: MODIFIERKEYS_FLAGS,
+        grfkeystate: MODIFIERKEYS_FLAGS,
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
         let idata_obj = pdataobj.ok()?;
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
-            *pdweffect = DROPEFFECT_COPY;
-            self.0
-                .drop_target_helper
-                .Drop(idata_obj, &cursor_position, *pdweffect)
-                .log_err();
-            ScreenToClient(self.0.hwnd, &mut cursor_position)
+            if let Some(paths) = self.active_paths.borrow().as_ref() {
+                let allowed = external_effects(*pdweffect);
+                let modifiers = external_modifiers(grfkeystate);
+                paths.update_drop_metadata(ExternalDropMetadata {
+                    allowed,
+                    preferred: self.preferred.get(),
+                    negotiated: negotiate_external_effect(allowed, self.preferred.get(), modifiers),
+                    modifiers,
+                    right_button: grfkeystate.0 & MK_RBUTTON.0 != 0,
+                });
+            }
+            ScreenToClient(self.window.hwnd, &mut cursor_position)
                 .ok()
                 .log_err();
         }
-        let scale_factor = self.0.state.scale_factor.get();
+        let scale_factor = self.window.state.scale_factor.get();
         let input = PlatformInput::FileDrop(FileDropEvent::Submit {
             position: logical_point(
                 cursor_position.x as f32,
@@ -1313,6 +1455,17 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             ),
         });
         self.handle_drag_drop(input);
+        unsafe {
+            if let Some(paths) = self.active_paths.borrow_mut().take() {
+                *pdweffect = native_external_effect(paths.drop_metadata().negotiated);
+            }
+        }
+        unsafe {
+            self.window
+                .drop_target_helper
+                .Drop(idata_obj, &POINT { x: pt.x, y: pt.y }, *pdweffect)
+                .log_err();
+        }
 
         Ok(())
     }
@@ -1544,7 +1697,11 @@ fn get_module_handle() -> HMODULE {
 
 fn register_drag_drop(window: &Rc<WindowsWindowInner>) -> Result<()> {
     let window_handle = window.hwnd;
-    let handler = WindowsDragDropHandler(window.clone());
+    let handler = WindowsDragDropHandler {
+        window: window.clone(),
+        active_paths: RefCell::new(None),
+        preferred: Cell::new(ExternalDropEffect::None),
+    };
     // The lifetime of `IDropTarget` is handled by Windows, it won't release until
     // we call `RevokeDragDrop`.
     // So, it's safe to drop it here.
@@ -1704,9 +1861,43 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::ClickState;
-    use gpui::{DevicePixels, MouseButton, point};
+    use super::{ClickState, negotiate_external_effect};
+    use gpui::{
+        DevicePixels, ExternalDropEffect, ExternalDropEffects, Modifiers, MouseButton, point,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn external_drop_negotiation_honors_modifiers_preference_and_capability() {
+        let allowed = ExternalDropEffects {
+            copy: true,
+            move_item: true,
+            link: false,
+        };
+        assert_eq!(
+            negotiate_external_effect(allowed, ExternalDropEffect::Move, Modifiers::default()),
+            ExternalDropEffect::Move
+        );
+        assert_eq!(
+            negotiate_external_effect(
+                allowed,
+                ExternalDropEffect::Move,
+                Modifiers {
+                    control: true,
+                    ..Modifiers::default()
+                }
+            ),
+            ExternalDropEffect::Copy
+        );
+        assert_eq!(
+            negotiate_external_effect(
+                ExternalDropEffects::default(),
+                ExternalDropEffect::Move,
+                Modifiers::default()
+            ),
+            ExternalDropEffect::None
+        );
+    }
 
     #[test]
     fn test_double_click_interval() {

@@ -3,7 +3,13 @@ use crate::{
     Window, point, seal::Sealed,
 };
 use smallvec::SmallVec;
-use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
+use std::{
+    any::Any,
+    fmt::Debug,
+    ops::Deref,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 /// An event from a platform input source.
 pub trait InputEvent: Sealed + 'static {
@@ -596,13 +602,111 @@ impl Deref for MouseExitEvent {
 }
 
 /// A collection of paths from the platform, such as from a file drop.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct ExternalPaths(pub SmallVec<[PathBuf; 2]>);
+/// Effects the drag source allows the target to negotiate.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct ExternalDropEffects {
+    /// The target may copy the items.
+    pub copy: bool,
+    /// The target may move the items.
+    pub move_item: bool,
+    /// The target may create a link.
+    pub link: bool,
+}
+
+/// One platform-neutral OLE-style drop effect.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum ExternalDropEffect {
+    /// The target rejects the drop.
+    #[default]
+    None,
+    /// Copy the dragged items.
+    Copy,
+    /// Move the dragged items.
+    Move,
+    /// Link the dragged items.
+    Link,
+}
+
+/// Source and target negotiation state shared during one external file drag.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct ExternalDropMetadata {
+    /// Effects offered by the source.
+    pub allowed: ExternalDropEffects,
+    /// Source-preferred effect, when advertised by the platform data object.
+    pub preferred: ExternalDropEffect,
+    /// Effect currently selected by the target.
+    pub negotiated: ExternalDropEffect,
+    /// Keyboard modifiers reported for the current drag callback.
+    pub modifiers: Modifiers,
+    /// Whether the right mouse button currently owns the drag.
+    pub right_button: bool,
+}
+
+/// External paths plus shared platform drop negotiation state.
+#[derive(Debug, Clone)]
+pub struct ExternalPaths {
+    paths: SmallVec<[PathBuf; 2]>,
+    metadata: Arc<Mutex<ExternalDropMetadata>>,
+}
+
+impl Default for ExternalPaths {
+    fn default() -> Self {
+        Self::new(SmallVec::new())
+    }
+}
+
+impl PartialEq for ExternalPaths {
+    fn eq(&self, other: &Self) -> bool {
+        self.paths == other.paths
+    }
+}
+
+impl Eq for ExternalPaths {}
 
 impl ExternalPaths {
+    /// Creates paths with default drop metadata for platforms without effect negotiation.
+    pub fn new(paths: SmallVec<[PathBuf; 2]>) -> Self {
+        Self {
+            paths,
+            metadata: Arc::new(Mutex::new(ExternalDropMetadata::default())),
+        }
+    }
+
+    /// Creates paths with metadata supplied by a native drop target.
+    pub fn with_metadata(paths: SmallVec<[PathBuf; 2]>, metadata: ExternalDropMetadata) -> Self {
+        Self {
+            paths,
+            metadata: Arc::new(Mutex::new(metadata)),
+        }
+    }
+
     /// Convert this collection of paths into a slice.
     pub fn paths(&self) -> &[PathBuf] {
-        &self.0
+        &self.paths
+    }
+
+    /// Reads the latest source/target negotiation snapshot.
+    pub fn drop_metadata(&self) -> ExternalDropMetadata {
+        *self
+            .metadata
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Replaces platform-owned metadata before dispatching the next drag callback.
+    pub fn update_drop_metadata(&self, metadata: ExternalDropMetadata) {
+        *self
+            .metadata
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = metadata;
+    }
+
+    /// Selects the effect that the native drop target must return to the source.
+    pub fn set_negotiated_effect(&self, effect: ExternalDropEffect) {
+        self.metadata
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .negotiated = effect;
     }
 }
 
@@ -610,6 +714,32 @@ impl Render for ExternalPaths {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         // the platform will render icons for the dragged files
         Empty
+    }
+}
+
+#[cfg(test)]
+mod external_paths_tests {
+    use super::*;
+
+    #[test]
+    fn cloned_external_paths_share_negotiated_effect() {
+        let paths = ExternalPaths::with_metadata(
+            SmallVec::from_vec(vec![PathBuf::from("fixture.txt")]),
+            ExternalDropMetadata {
+                allowed: ExternalDropEffects {
+                    copy: true,
+                    move_item: true,
+                    link: false,
+                },
+                preferred: ExternalDropEffect::Move,
+                negotiated: ExternalDropEffect::Move,
+                ..ExternalDropMetadata::default()
+            },
+        );
+        let clone = paths.clone();
+        clone.set_negotiated_effect(ExternalDropEffect::Copy);
+        assert_eq!(paths.drop_metadata().negotiated, ExternalDropEffect::Copy);
+        assert_eq!(paths.paths(), [PathBuf::from("fixture.txt")]);
     }
 }
 
