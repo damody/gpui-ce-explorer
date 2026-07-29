@@ -75,6 +75,8 @@ struct EditableTextColors {
     /// Color of the selection box.
     /// Could be driven by platform-provided styling?
     selection: Hsla,
+    /// Color of glyphs inside the selection box.
+    selection_text: Hsla,
     /// Color of the caret / text cursor
     caret: Hsla,
     /// Color of IME marked underlines
@@ -104,6 +106,7 @@ impl Default for EditableTextColors {
         Self {
             placeholder: WHITE_50PC,
             selection: LIGHT_NAVY_BLUE_50PC,
+            selection_text: Hsla::white(),
             caret: Hsla::white(),
             ime_underline: WHITE_70PC,
         }
@@ -111,6 +114,13 @@ impl Default for EditableTextColors {
 }
 
 impl EditableTextElement {
+    fn pointer_to_text_offset(
+        inner_bounds: Bounds<Pixels>,
+        scroll_offset: Point<Pixels>,
+    ) -> Point<Pixels> {
+        -(inner_bounds.origin + scroll_offset)
+    }
+
     /// Assigns the underlying state of this element, which should persist across multiple frames.
     /// The user should either create the entity once or utilize `Window::use_keyed_state`
     /// to create an entity intrinsicly linked to the element.
@@ -166,6 +176,12 @@ impl EditableTextElement {
     /// Cannot be refined via [`StyleRefinement`](gpui::StyleRefinement) due to limitations in the fields of [`Style`](gpui::Style).
     pub fn selection_color(mut self, color: Hsla) -> Self {
         self.colors.selection = color;
+        self
+    }
+
+    /// Sets the foreground color of selected text.
+    pub fn selection_text_color(mut self, color: Hsla) -> Self {
+        self.colors.selection_text = color;
         self
     }
 
@@ -430,15 +446,36 @@ impl Element for EditableTextElement {
 
             // Actually draw the elements we constructed during prepaint
             let line_h = window.line_height();
-            for PrepaintLine { line, point, align } in prepaint.elements.lines.drain(..) {
-                let _ = line.paint(point, line_h, align, Some(bounds), window, cx);
+            for quad in &prepaint.elements.selection {
+                window.paint_quad(quad.clone());
+            }
+            for line in &prepaint.elements.lines {
+                let _ = line
+                    .line
+                    .paint(line.point, line_h, line.align, Some(bounds), window, cx);
+            }
+            // Repaint only the selected glyph pixels through each selection rectangle. The
+            // shaped layout is shared, so this gives Windows HighlightText parity without a
+            // second shaping pass or a translucent overlay that weakens contrast.
+            for quad in &prepaint.elements.selection {
+                window.paint_layer(quad.bounds, |window| {
+                    for line in &prepaint.elements.lines {
+                        let _ = line.selection_line.paint(
+                            line.point,
+                            line_h,
+                            line.align,
+                            Some(bounds),
+                            window,
+                            cx,
+                        );
+                    }
+                });
             }
             for quad in prepaint.elements.ime_marked.drain(..) {
                 window.paint_quad(quad);
             }
-            for quad in prepaint.elements.selection.drain(..) {
-                window.paint_quad(quad);
-            }
+            prepaint.elements.selection.clear();
+            prepaint.elements.lines.clear();
             if let Some(quad) = prepaint.elements.caret.take() {
                 window.paint_quad(quad);
             }
@@ -496,7 +533,8 @@ impl EditableTextElement {
         cx: &mut App,
     ) {
         let inner_bounds = prepaint.interactivity.inner_bounds;
-        let to_local_position = -(bounds.origin + prepaint.interactivity.scroll_offset);
+        let to_local_position =
+            Self::pointer_to_text_offset(inner_bounds, prepaint.interactivity.scroll_offset);
 
         let ime_handler = ElementInputHandler::new(inner_bounds, entity.clone());
         window.handle_input(&prepaint.focus_handle, ime_handler, cx);
@@ -678,6 +716,7 @@ impl PrelayoutState {
 
 struct PrepaintLine {
     line: Arc<WrappedLine>,
+    selection_line: Arc<WrappedLine>,
     point: Point<Pixels>,
     align: TextAlign,
 }
@@ -752,6 +791,7 @@ impl PrepaintElements {
                 let point = inner_bounds.origin + point(scroll_offset.x, line_y);
                 elements.lines.push(PrepaintLine {
                     line: wrapped.clone(),
+                    selection_line: Arc::new(wrapped.with_color(colors.selection_text)),
                     point,
                     align: TextAlign::Left,
                 });
@@ -895,5 +935,21 @@ fn build_quad_over_text(
         ));
 
         quad_corners
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EditableTextElement;
+    use gpui::{Bounds, point, px, size};
+
+    #[test]
+    fn pointer_hit_testing_uses_padded_inner_origin_and_scroll_offset() {
+        let inner = Bounds::new(point(px(142.0), px(28.0)), size(px(300.0), px(32.0)));
+        let offset = EditableTextElement::pointer_to_text_offset(inner, point(px(-18.0), px(-3.0)));
+        assert_eq!(offset, point(px(-124.0), px(-25.0)));
+
+        let pointer = point(px(136.0), px(31.0));
+        assert_eq!(pointer + offset, point(px(12.0), px(6.0)));
     }
 }
