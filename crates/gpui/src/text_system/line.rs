@@ -270,6 +270,20 @@ impl WrappedLine {
         self.layout.len()
     }
 
+    /// Returns the same shaped glyphs with every decoration run painted in `color`.
+    /// This avoids reshaping text when controls need a platform selection foreground.
+    pub fn with_color(&self, color: Hsla) -> Self {
+        let mut decoration_runs = self.decoration_runs.clone();
+        for run in &mut decoration_runs {
+            run.color = color;
+        }
+        Self {
+            layout: Arc::clone(&self.layout),
+            text: self.text.clone(),
+            decoration_runs,
+        }
+    }
+
     /// Paint this line of text to the window.
     pub fn paint(
         &self,
