@@ -4,12 +4,12 @@ use crate::editable_text::{
     layout::{EditableTextLayoutResult, EditableTextLayoutState, TextLineSegment},
 };
 use gpui::{
-    App, Bounds, CursorStyle, DispatchPhase, Display, Element, ElementId, ElementInputHandler,
-    Entity, FocusHandle, Focusable, Hitbox, HitboxBehavior, Hsla, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Size, StatefulInteractiveElement, Style,
-    StyleRefinement, Styled, TextAlign, TextLayout, WeakEntity, Window, WrappedLine, fill, point,
-    px, size,
+    App, Bounds, ContentMask, CursorStyle, DispatchPhase, Display, Element, ElementId,
+    ElementInputHandler, Entity, FocusHandle, Focusable, Hitbox, HitboxBehavior, Hsla,
+    InteractiveElement, Interactivity, IntoElement, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Size,
+    StatefulInteractiveElement, Style, StyleRefinement, Styled, TextAlign, TextLayout, WeakEntity,
+    Window, WrappedLine, fill, point, px, size,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, ops::Range, rc::Rc, sync::Arc, time::Duration};
@@ -458,18 +458,23 @@ impl Element for EditableTextElement {
             // shaped layout is shared, so this gives Windows HighlightText parity without a
             // second shaping pass or a translucent overlay that weakens contrast.
             for quad in &prepaint.elements.selection {
-                window.paint_layer(quad.bounds, |window| {
-                    for line in &prepaint.elements.lines {
-                        let _ = line.selection_line.paint(
-                            line.point,
-                            line_h,
-                            line.align,
-                            Some(bounds),
-                            window,
-                            cx,
-                        );
-                    }
-                });
+                window.with_content_mask(
+                    Some(ContentMask {
+                        bounds: quad.bounds,
+                    }),
+                    |window| {
+                        for line in &prepaint.elements.lines {
+                            let _ = line.selection_line.paint(
+                                line.point,
+                                line_h,
+                                line.align,
+                                Some(bounds),
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                );
             }
             for quad in prepaint.elements.ime_marked.drain(..) {
                 window.paint_quad(quad);
