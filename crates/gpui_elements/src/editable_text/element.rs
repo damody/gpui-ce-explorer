@@ -772,6 +772,11 @@ impl PrepaintElements {
         let mut elements = PrepaintElements::default();
 
         let line_height = window.line_height();
+        let selection_height = selection_paint_height(
+            state.layout_data.supports_multiline,
+            line_height,
+            inner_bounds.size.height,
+        );
         let is_range_contained_by_range =
             |text_range: &Range<usize>, containing_range: &Range<usize>| {
                 if text_range.is_empty() {
@@ -811,7 +816,7 @@ impl PrepaintElements {
                         Bounds::from_corners(
                             inner_bounds.origin + point(Pixels::ZERO, line_y),
                             inner_bounds.origin
-                                + point(EMPTY_LINE_SELECTION_WIDTH, line_y + line_height),
+                                + point(EMPTY_LINE_SELECTION_WIDTH, line_y + selection_height),
                         ),
                         colors.selection,
                     ));
@@ -820,7 +825,7 @@ impl PrepaintElements {
                         &selection,
                         segment,
                         line_y,
-                        line_height,
+                        selection_height,
                         Pixels::ZERO,
                     );
                     elements.selection.extend(PrepaintElements::build_quads(
@@ -943,9 +948,21 @@ fn build_quad_over_text(
     }
 }
 
+fn selection_paint_height(
+    supports_multiline: bool,
+    typography_line_height: Pixels,
+    inner_height: Pixels,
+) -> Pixels {
+    if supports_multiline {
+        typography_line_height
+    } else {
+        inner_height
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::EditableTextElement;
+    use super::{EditableTextElement, selection_paint_height};
     use gpui::{Bounds, point, px, size};
 
     #[test]
@@ -956,5 +973,11 @@ mod tests {
 
         let pointer = point(px(136.0), px(31.0));
         assert_eq!(pointer + offset, point(px(12.0), px(6.0)));
+    }
+
+    #[test]
+    fn single_line_selection_fills_inner_height_without_changing_multiline_rows() {
+        assert_eq!(selection_paint_height(false, px(22.0), px(30.0)), px(30.0));
+        assert_eq!(selection_paint_height(true, px(22.0), px(30.0)), px(22.0));
     }
 }
