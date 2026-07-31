@@ -56,6 +56,10 @@ gpui::actions!(
         SelectUp,
         /// Extend selection down one visual line.
         SelectDown,
+        /// Extend selection to the beginning of the current line.
+        SelectLineStart,
+        /// Extend selection to the end of the current line.
+        SelectLineEnd,
         /// Extend selection to the beginning of the content.
         SelectDocumentStart,
         /// Extend selection to the end of the content.
@@ -154,6 +158,8 @@ pub fn default_bindings() -> gpui::ActionBindingCollection {
             // Mac keyboards don't have Home/End keys, so cmd-left/right are standard
             .with::<NavLineStart>("cmd-left")
             .with::<NavLineEnd>("cmd-right")
+            .with::<SelectLineStart>("cmd-shift-left")
+            .with::<SelectLineEnd>("cmd-shift-right")
             .with::<NavDocumentStart>("cmd-up")
             .with::<NavDocumentEnd>("cmd-down")
             .with::<SelectDocumentStart>("cmd-shift-up")
@@ -173,6 +179,8 @@ pub fn default_bindings() -> gpui::ActionBindingCollection {
             .with::<DeleteToLineEnd>("ctrl-shift-delete")
             .with::<NavLineStart>("home")
             .with::<NavLineEnd>("end")
+            .with::<SelectLineStart>("shift-home")
+            .with::<SelectLineEnd>("shift-end")
             .with::<NavDocumentStart>("ctrl-home")
             .with::<NavDocumentEnd>("ctrl-end")
             .with::<SelectDocumentStart>("ctrl-shift-home")
@@ -240,6 +248,10 @@ pub trait EditableTextActionHandler<Context>: Sized {
     fn select_up(&mut self, _: &SelectUp, _w: &mut Window, _cx: &mut Context) {}
     /// Extend selection down one visual line.
     fn select_down(&mut self, _: &SelectDown, _w: &mut Window, _cx: &mut Context) {}
+    /// Extend selection to the beginning of the current line.
+    fn select_line_start(&mut self, _: &SelectLineStart, _w: &mut Window, _cx: &mut Context) {}
+    /// Extend selection to the end of the current line.
+    fn select_line_end(&mut self, _: &SelectLineEnd, _w: &mut Window, _cx: &mut Context) {}
     /// Extend selection to the beginning of the document.
     fn select_start(&mut self, _: &SelectDocumentStart, _w: &mut Window, _cx: &mut Context) {}
     /// Extend selection to the end of the document.
@@ -342,6 +354,8 @@ pub(super) trait EditableTextActionElement<State> {
         register_action!(self, select_right);
         register_action!(self, select_up);
         register_action!(self, select_down);
+        register_action!(self, select_line_start);
+        register_action!(self, select_line_end);
         register_action!(self, select_start);
         register_action!(self, select_end);
         register_action!(self, select_left_word);
