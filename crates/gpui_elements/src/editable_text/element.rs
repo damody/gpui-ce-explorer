@@ -31,6 +31,7 @@ pub fn editable_text(id: impl Into<ElementId>) -> EditableTextElement {
         colors: EditableTextColors::default(),
         caret_blink_interval: None,
         caret_height: None,
+        caret_top_offset: None,
     };
     this.interactivity.element_id = Some(id.into());
 
@@ -67,6 +68,7 @@ pub struct EditableTextElement {
     colors: EditableTextColors,
     caret_blink_interval: Option<Duration>,
     caret_height: Option<Pixels>,
+    caret_top_offset: Option<Pixels>,
 }
 
 /// EditableText styling that goes beyond what Style/StyleRefinement supports
@@ -168,6 +170,12 @@ impl EditableTextElement {
     /// Sets the painted caret height independently from the text line box.
     pub fn caret_height(mut self, height: Pixels) -> Self {
         self.caret_height = Some(height);
+        self
+    }
+
+    /// Positions the painted caret from the top of its typography line box.
+    pub fn caret_top_offset(mut self, offset: Pixels) -> Self {
+        self.caret_top_offset = Some(offset);
         self
     }
 
@@ -422,6 +430,7 @@ impl Element for EditableTextElement {
             &prepaint,
             &self.colors,
             self.caret_height,
+            self.caret_top_offset,
             window,
         );
 
@@ -771,6 +780,7 @@ impl PrepaintElements {
         prepaint: &InteractivityPrepaint,
         colors: &EditableTextColors,
         requested_caret_height: Option<Pixels>,
+        requested_caret_top_offset: Option<Pixels>,
         window: &mut Window,
     ) -> PrepaintElements {
         let InteractivityPrepaint {
@@ -885,11 +895,11 @@ impl PrepaintElements {
         }
 
         if *caret_visible && let Some(carent_point) = caret_point {
-            let caret_height = requested_caret_height
-                .unwrap_or(line_height)
-                .max(Pixels::ZERO)
-                .min(line_height);
-            let caret_inset = (line_height - caret_height) / 2.0;
+            let (caret_inset, caret_height) = caret_vertical_geometry(
+                line_height,
+                requested_caret_height,
+                requested_caret_top_offset,
+            );
             let quad = fill(
                 Bounds::new(
                     inner_bounds.origin + carent_point + point(Pixels::ZERO, caret_inset),
@@ -902,6 +912,22 @@ impl PrepaintElements {
 
         elements
     }
+}
+
+fn caret_vertical_geometry(
+    line_height: Pixels,
+    requested_height: Option<Pixels>,
+    requested_top_offset: Option<Pixels>,
+) -> (Pixels, Pixels) {
+    let caret_height = requested_height
+        .unwrap_or(line_height)
+        .max(Pixels::ZERO)
+        .min(line_height);
+    let caret_inset = requested_top_offset
+        .unwrap_or((line_height - caret_height) / 2.0)
+        .max(Pixels::ZERO)
+        .min((line_height - caret_height).max(Pixels::ZERO));
+    (caret_inset, caret_height)
 }
 
 fn build_quad_over_text(
@@ -982,7 +1008,7 @@ fn selection_paint_height(
 
 #[cfg(test)]
 mod tests {
-    use super::{EditableTextElement, selection_paint_height};
+    use super::{EditableTextElement, caret_vertical_geometry, selection_paint_height};
     use gpui::{Bounds, point, px, size};
 
     #[test]
@@ -999,5 +1025,17 @@ mod tests {
     fn single_line_selection_fills_inner_height_without_changing_multiline_rows() {
         assert_eq!(selection_paint_height(false, px(22.0), px(30.0)), px(30.0));
         assert_eq!(selection_paint_height(true, px(22.0), px(30.0)), px(22.0));
+    }
+
+    #[test]
+    fn caret_uses_explicit_baseline_relative_geometry_and_clamps_to_the_line() {
+        assert_eq!(
+            caret_vertical_geometry(px(22.0), Some(px(14.0)), Some(px(3.0))),
+            (px(3.0), px(14.0))
+        );
+        assert_eq!(
+            caret_vertical_geometry(px(22.0), Some(px(30.0)), Some(px(20.0))),
+            (px(0.0), px(22.0))
+        );
     }
 }
