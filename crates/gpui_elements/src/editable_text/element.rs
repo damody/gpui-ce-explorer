@@ -30,6 +30,7 @@ pub fn editable_text(id: impl Into<ElementId>) -> EditableTextElement {
         accepts_input: true,
         colors: EditableTextColors::default(),
         caret_blink_interval: None,
+        caret_height: None,
     };
     this.interactivity.element_id = Some(id.into());
 
@@ -65,6 +66,7 @@ pub struct EditableTextElement {
     accepts_input: bool,
     colors: EditableTextColors,
     caret_blink_interval: Option<Duration>,
+    caret_height: Option<Pixels>,
 }
 
 /// EditableText styling that goes beyond what Style/StyleRefinement supports
@@ -161,6 +163,12 @@ impl EditableTextElement {
     /// Sets the blinking interval of the caret to 500ms
     pub fn caret_blink_interval_500ms(self) -> Self {
         self.caret_blink_interval(BLINK_INTERVAL_500MS)
+    }
+
+    /// Sets the painted caret height independently from the text line box.
+    pub fn caret_height(mut self, height: Pixels) -> Self {
+        self.caret_height = Some(height);
+        self
     }
 
     /// Sets the color of the placeholder text which is rendered when the element's stored text is empty.
@@ -409,7 +417,13 @@ impl Element for EditableTextElement {
         );
 
         let state = request_layout.state.read(cx);
-        let elements = PrepaintElements::build_elements(state, &prepaint, &self.colors, window);
+        let elements = PrepaintElements::build_elements(
+            state,
+            &prepaint,
+            &self.colors,
+            self.caret_height,
+            window,
+        );
 
         PrepaintState {
             interactivity: prepaint,
@@ -756,6 +770,7 @@ impl PrepaintElements {
         state: &EditableTextState,
         prepaint: &InteractivityPrepaint,
         colors: &EditableTextColors,
+        requested_caret_height: Option<Pixels>,
         window: &mut Window,
     ) -> PrepaintElements {
         let InteractivityPrepaint {
@@ -870,10 +885,15 @@ impl PrepaintElements {
         }
 
         if *caret_visible && let Some(carent_point) = caret_point {
+            let caret_height = requested_caret_height
+                .unwrap_or(line_height)
+                .max(Pixels::ZERO)
+                .min(line_height);
+            let caret_inset = (line_height - caret_height) / 2.0;
             let quad = fill(
                 Bounds::new(
-                    inner_bounds.origin + carent_point,
-                    size(gpui::px(CARET_RENDER_WIDTH), line_height),
+                    inner_bounds.origin + carent_point + point(Pixels::ZERO, caret_inset),
+                    size(gpui::px(CARET_RENDER_WIDTH), caret_height),
                 ),
                 colors.caret,
             );
