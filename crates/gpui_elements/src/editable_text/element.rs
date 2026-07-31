@@ -923,10 +923,14 @@ fn caret_vertical_geometry(
         .unwrap_or(line_height)
         .max(Pixels::ZERO)
         .min(line_height);
-    let caret_inset = requested_top_offset
-        .unwrap_or((line_height - caret_height) / 2.0)
-        .max(Pixels::ZERO)
-        .min((line_height - caret_height).max(Pixels::ZERO));
+    let caret_inset = requested_top_offset.map_or_else(
+        || {
+            ((line_height - caret_height) / 2.0)
+                .max(Pixels::ZERO)
+                .min((line_height - caret_height).max(Pixels::ZERO))
+        },
+        |offset| offset.max(Pixels::ZERO),
+    );
     (caret_inset, caret_height)
 }
 
@@ -1028,14 +1032,14 @@ mod tests {
     }
 
     #[test]
-    fn caret_uses_explicit_baseline_relative_geometry_and_clamps_to_the_line() {
+    fn caret_uses_explicit_baseline_relative_geometry_without_losing_leading() {
         assert_eq!(
             caret_vertical_geometry(px(22.0), Some(px(14.0)), Some(px(3.0))),
             (px(3.0), px(14.0))
         );
         assert_eq!(
             caret_vertical_geometry(px(22.0), Some(px(30.0)), Some(px(20.0))),
-            (px(0.0), px(22.0))
+            (px(20.0), px(22.0))
         );
     }
 }
