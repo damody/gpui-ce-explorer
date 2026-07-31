@@ -989,6 +989,24 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
         }
     }
 
+    fn select_line_start(
+        &mut self,
+        _: &SelectLineStart,
+        _w: &mut Window,
+        cx: &mut Context<'app, Self>,
+    ) {
+        self.select_linear(NavigationDirection::Back, TextBoundary::Line, cx);
+    }
+
+    fn select_line_end(
+        &mut self,
+        _: &SelectLineEnd,
+        _w: &mut Window,
+        cx: &mut Context<'app, Self>,
+    ) {
+        self.select_linear(NavigationDirection::Forward, TextBoundary::Line, cx);
+    }
+
     fn select_start(
         &mut self,
         _: &SelectDocumentStart,
@@ -1459,6 +1477,64 @@ mod tests {
             });
         })
         .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_shifted_horizontal_selection_preserves_anchor_and_reverses(cx: &mut TestAppContext) {
+        let view = create_test_input(cx, "hello", 2);
+        view.update(cx, |view, window, cx| {
+            view.input.update(cx, |input, cx| {
+                input.select_right(&SelectRight, window, cx);
+                input.select_right(&SelectRight, window, cx);
+                assert_eq!(input.selected_range, (4, 2).into());
+
+                input.select_left(&SelectLeft, window, cx);
+                input.select_left(&SelectLeft, window, cx);
+                assert_eq!(input.selected_range, (2, 2).into());
+
+                input.select_left(&SelectLeft, window, cx);
+                assert_eq!(input.selected_range, (1, 2).into());
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_select_to_line_boundaries_preserves_anchor(cx: &mut TestAppContext) {
+        let view = create_test_input(cx, "first\nsecond\nthird", 9);
+        view.update(cx, |view, window, cx| {
+            view.input.update(cx, |input, cx| {
+                input.select_line_start(&SelectLineStart, window, cx);
+                assert_eq!(input.selected_range, (6, 9).into());
+
+                input.select_line_end(&SelectLineEnd, window, cx);
+                assert_eq!(input.selected_range, (12, 9).into());
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_select_entire_single_line_with_shift_home_and_end(cx: &mut TestAppContext) {
+        let from_start = create_test_input(cx, "hello", 0);
+        from_start
+            .update(cx, |view, window, cx| {
+                view.input.update(cx, |input, cx| {
+                    input.select_line_end(&SelectLineEnd, window, cx);
+                    assert_eq!(input.selected_range, (5, 0).into());
+                });
+            })
+            .unwrap();
+
+        let from_end = create_test_input(cx, "hello", 5);
+        from_end
+            .update(cx, |view, window, cx| {
+                view.input.update(cx, |input, cx| {
+                    input.select_line_start(&SelectLineStart, window, cx);
+                    assert_eq!(input.selected_range, (0, 5).into());
+                });
+            })
+            .unwrap();
     }
 
     #[gpui::test]

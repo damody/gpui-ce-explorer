@@ -1,15 +1,15 @@
 use crate::editable_text::{
-    BLINK_INTERVAL_500MS, Caret, EditableTextState,
+    BLINK_INTERVAL_500MS, Caret, EditableTextState, TextBoundary,
     actions::{DEFAULT_INPUT_CONTEXT, EditableTextActionElement, EditableTextActionHandler},
     layout::{EditableTextLayoutResult, EditableTextLayoutState, TextLineSegment},
 };
 use gpui::{
     App, Bounds, ContentMask, CursorStyle, DispatchPhase, Display, Element, ElementId,
     ElementInputHandler, Entity, FocusHandle, Focusable, Hitbox, HitboxBehavior, Hsla,
-    InteractiveElement, Interactivity, IntoElement, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Size,
-    StatefulInteractiveElement, Style, StyleRefinement, Styled, TextAlign, TextLayout, WeakEntity,
-    Window, WrappedLine, fill, point, px, size,
+    InteractiveElement, Interactivity, IntoElement, KeyDownEvent, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, PaintQuad, Pixels, Point,
+    SharedString, Size, StatefulInteractiveElement, Style, StyleRefinement, Styled, TextAlign,
+    TextLayout, WeakEntity, Window, WrappedLine, fill, point, px, size,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, ops::Range, rc::Rc, sync::Arc, time::Duration};
@@ -37,6 +37,34 @@ pub fn editable_text(id: impl Into<ElementId>) -> EditableTextElement {
 
     this = this.key_context(DEFAULT_INPUT_CONTEXT);
     this.register_actions();
+
+    // Keep shifted selection functional when a platform delivers these non-text keys outside
+    // GPUI's keymap action path. If a binding dispatches normally, its action stops propagation
+    // before this fallback runs, so the caret endpoint is never moved twice.
+    let state_entity = Rc::clone(&this.state_entity);
+    this = this.on_key_down(move |event: &KeyDownEvent, _window, cx| {
+        let modifiers = event.keystroke.modifiers;
+        if !modifiers.shift || modifiers.control || modifiers.alt || modifiers.platform {
+            return;
+        }
+        let movement = match event.keystroke.key.as_str() {
+            "left" => Some((NavigationDirection::Back, TextBoundary::Graphmeme)),
+            "right" => Some((NavigationDirection::Forward, TextBoundary::Graphmeme)),
+            "home" => Some((NavigationDirection::Back, TextBoundary::Line)),
+            "end" => Some((NavigationDirection::Forward, TextBoundary::Line)),
+            _ => None,
+        };
+        let Some((direction, boundary)) = movement else {
+            return;
+        };
+        let Some(entity) = state_entity.borrow().upgrade() else {
+            return;
+        };
+        entity.update(cx, |state, cx| {
+            state.select_linear(direction, boundary, cx);
+        });
+        cx.stop_propagation();
+    });
 
     this
 }
