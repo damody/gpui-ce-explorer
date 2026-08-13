@@ -193,7 +193,10 @@ impl WgpuAtlasState {
         let size = min_size.min(&max_atlas_size).max(&DEFAULT_ATLAS_SIZE);
         let format = match kind {
             AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
-            AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => self.color_texture_format,
+            AtlasTextureKind::Subpixel
+            | AtlasTextureKind::Polychrome
+            | AtlasTextureKind::Bc7Icon
+            | AtlasTextureKind::Bc7Thumbnail => self.color_texture_format,
         };
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -304,6 +307,7 @@ impl ops::Index<AtlasTextureKind> for WgpuAtlasStorage {
             AtlasTextureKind::Monochrome => &self.monochrome_textures,
             AtlasTextureKind::Subpixel => &self.subpixel_textures,
             AtlasTextureKind::Polychrome => &self.polychrome_textures,
+            AtlasTextureKind::Bc7Icon | AtlasTextureKind::Bc7Thumbnail => &self.polychrome_textures,
         }
     }
 }
@@ -314,6 +318,9 @@ impl ops::IndexMut<AtlasTextureKind> for WgpuAtlasStorage {
             AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
             AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
             AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::Bc7Icon | AtlasTextureKind::Bc7Thumbnail => {
+                &mut self.polychrome_textures
+            }
         }
     }
 }
@@ -334,6 +341,7 @@ impl ops::Index<AtlasTextureId> for WgpuAtlasStorage {
             AtlasTextureKind::Monochrome => &self.monochrome_textures,
             AtlasTextureKind::Subpixel => &self.subpixel_textures,
             AtlasTextureKind::Polychrome => &self.polychrome_textures,
+            AtlasTextureKind::Bc7Icon | AtlasTextureKind::Bc7Thumbnail => &self.polychrome_textures,
         };
         textures[id.index as usize]
             .as_ref()
@@ -445,6 +453,7 @@ mod tests {
         let key = AtlasKey::Image(RenderImageParams {
             image_id: ImageId(1),
             frame_index: 0,
+            compressed_bc7_srgb: None,
         });
         let size = Size {
             width: DevicePixels(1),
