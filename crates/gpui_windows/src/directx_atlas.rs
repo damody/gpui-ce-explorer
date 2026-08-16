@@ -26,7 +26,14 @@ struct DirectXAtlasState {
     bc7_icon_textures: AtlasTextureList<DirectXAtlasTexture>,
     bc7_thumbnail_textures: AtlasTextureList<DirectXAtlasTexture>,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
-    bc7_costs: FxHashMap<AtlasKey, u64>,
+    bc7_residency: Bc7Residency,
+}
+
+#[derive(Default)]
+struct Bc7Residency {
+    costs: FxHashMap<AtlasKey, u64>,
+    last_used: FxHashMap<AtlasKey, u64>,
+    clock: u64,
 }
 
 struct DirectXAtlasTexture {
@@ -55,7 +62,7 @@ impl DirectXAtlas {
             bc7_icon_textures: Default::default(),
             bc7_thumbnail_textures: Default::default(),
             tiles_by_key: Default::default(),
-            bc7_costs: Default::default(),
+            bc7_residency: Default::default(),
         }))
     }
 
@@ -82,7 +89,7 @@ impl DirectXAtlas {
         lock.bc7_icon_textures = AtlasTextureList::default();
         lock.bc7_thumbnail_textures = AtlasTextureList::default();
         lock.tiles_by_key.clear();
-        lock.bc7_costs.clear();
+        lock.bc7_residency = Bc7Residency::default();
         lock.publish_bc7_stats();
     }
 }
@@ -147,12 +154,26 @@ impl PlatformAtlas for DirectXAtlas {
         if format_support & required != required {
             anyhow::bail!("D3D11 adapter does not support BC7 sampling");
         }
+        let limit = gpui::compressed_gpu_cache_limit(owner);
+        while lock.bc7_resident_bytes(key.texture_kind()) > limit {
+            let Some(victim) = lock.least_recent_bc7(key.texture_kind()) else {
+                break;
+            };
+            lock.remove_key(&victim, true);
+        }
         if let Some(tile) = lock.tiles_by_key.get(key).copied() {
+            lock.promote_bc7(key);
             return Ok(Some(tile));
         }
-        let resident = lock.bc7_resident_bytes(key.texture_kind());
-        if resident.saturating_add(blocks.len() as u64) > gpui::compressed_gpu_cache_limit(owner) {
-            anyhow::bail!("BC7 GPU cache budget is full");
+        while lock
+            .bc7_resident_bytes(key.texture_kind())
+            .saturating_add(blocks.len() as u64)
+            > limit
+        {
+            let Some(victim) = lock.least_recent_bc7(key.texture_kind()) else {
+                anyhow::bail!("BC7 GPU cache budget is full");
+            };
+            lock.remove_key(&victim, true);
         }
         let tile = lock
             .allocate_bc7(size, padded_size, key.texture_kind())
@@ -165,19 +186,28 @@ impl PlatformAtlas for DirectXAtlas {
             row_pitch,
             blocks,
         );
+        gpui::record_compressed_gpu_upload(owner);
         lock.tiles_by_key.insert(key.clone(), tile);
-        lock.bc7_costs.insert(key.clone(), blocks.len() as u64);
+        lock.bc7_residency.insert(key.clone(), blocks.len() as u64);
         lock.publish_bc7_stats();
         Ok(Some(tile))
     }
 
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
-        lock.remove_key(key);
+        lock.remove_key(key, false);
     }
 }
 
 impl DirectXAtlasState {
+    fn promote_bc7(&mut self, key: &AtlasKey) {
+        self.bc7_residency.promote(key);
+    }
+
+    fn least_recent_bc7(&self, kind: AtlasTextureKind) -> Option<AtlasKey> {
+        self.bc7_residency.least_recent(kind)
+    }
+
     fn bc7_kind(kind: AtlasTextureKind) -> Option<gpui::CompressedRasterKind> {
         match kind {
             AtlasTextureKind::Bc7Icon => Some(gpui::CompressedRasterKind::Icon),
@@ -187,11 +217,7 @@ impl DirectXAtlasState {
     }
 
     fn bc7_resident_bytes(&self, kind: AtlasTextureKind) -> u64 {
-        self.bc7_costs
-            .iter()
-            .filter(|(key, _)| key.texture_kind() == kind)
-            .map(|(_, bytes)| *bytes)
-            .fold(0_u64, u64::saturating_add)
+        self.bc7_residency.bytes(kind)
     }
 
     fn publish_bc7_stats(&self) {
@@ -202,23 +228,18 @@ impl DirectXAtlasState {
                 gpui::CompressedRasterKind::Thumbnail,
             ),
         ] {
-            let bytes = self
-                .bc7_costs
-                .iter()
-                .filter(|(key, _)| key.texture_kind() == kind)
-                .map(|(_, bytes)| *bytes)
-                .sum();
-            let entries = self
-                .bc7_costs
-                .keys()
-                .filter(|key| key.texture_kind() == kind)
-                .count() as u64;
+            let bytes = self.bc7_residency.bytes(kind);
+            let entries = self.bc7_residency.entries(kind);
             gpui::record_compressed_gpu_cache(owner, bytes, entries);
         }
     }
 
-    fn remove_key(&mut self, key: &AtlasKey) {
-        self.bc7_costs.remove(key);
+    fn remove_key(&mut self, key: &AtlasKey, evicted: bool) {
+        let owner = Self::bc7_kind(key.texture_kind());
+        self.bc7_residency.remove(key);
+        if evicted && let Some(owner) = owner {
+            gpui::record_compressed_gpu_eviction(owner);
+        }
         let Some(tile) = self.tiles_by_key.remove(key) else {
             self.publish_bc7_stats();
             return;
@@ -526,5 +547,91 @@ fn etagere_point_to_device(value: etagere::Point) -> Point<DevicePixels> {
     Point {
         x: DevicePixels::from(value.x),
         y: DevicePixels::from(value.y),
+    }
+}
+
+impl Bc7Residency {
+    fn insert(&mut self, key: AtlasKey, bytes: u64) {
+        self.costs.insert(key.clone(), bytes);
+        self.promote(&key);
+    }
+
+    fn promote(&mut self, key: &AtlasKey) {
+        self.clock = self.clock.wrapping_add(1);
+        self.last_used.insert(key.clone(), self.clock);
+    }
+
+    fn least_recent(&self, kind: AtlasTextureKind) -> Option<AtlasKey> {
+        self.last_used
+            .iter()
+            .filter(|(key, _)| key.texture_kind() == kind)
+            .min_by_key(|(_, last_used)| **last_used)
+            .map(|(key, _)| key.clone())
+    }
+
+    fn bytes(&self, kind: AtlasTextureKind) -> u64 {
+        self.costs
+            .iter()
+            .filter(|(key, _)| key.texture_kind() == kind)
+            .map(|(_, bytes)| *bytes)
+            .fold(0_u64, u64::saturating_add)
+    }
+
+    fn entries(&self, kind: AtlasTextureKind) -> u64 {
+        self.costs
+            .keys()
+            .filter(|key| key.texture_kind() == kind)
+            .count() as u64
+    }
+
+    fn remove(&mut self, key: &AtlasKey) -> Option<u64> {
+        self.last_used.remove(key);
+        self.costs.remove(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{CompressedRasterKind, ImageId, RenderImageParams};
+
+    fn key(id: usize, kind: CompressedRasterKind) -> AtlasKey {
+        AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(id),
+            frame_index: 0,
+            compressed_bc7_srgb: Some(kind),
+        })
+    }
+
+    #[test]
+    fn lru_selection_promotes_hits_and_never_crosses_ownership_kinds() {
+        let icon_old = key(1, CompressedRasterKind::Icon);
+        let icon_new = key(2, CompressedRasterKind::Icon);
+        let thumbnail = key(3, CompressedRasterKind::Thumbnail);
+        let mut residency = Bc7Residency::default();
+        residency.insert(icon_old.clone(), 16);
+        residency.insert(thumbnail.clone(), 64);
+        residency.insert(icon_new.clone(), 32);
+        assert!(
+            residency
+                .least_recent(AtlasTextureKind::Bc7Icon)
+                .is_some_and(|key| key == icon_old)
+        );
+        residency.promote(&icon_old);
+        assert!(
+            residency
+                .least_recent(AtlasTextureKind::Bc7Icon)
+                .is_some_and(|key| key == icon_new)
+        );
+        assert!(
+            residency
+                .least_recent(AtlasTextureKind::Bc7Thumbnail)
+                .is_some_and(|key| key == thumbnail)
+        );
+        assert_eq!(residency.bytes(AtlasTextureKind::Bc7Icon), 48);
+        assert_eq!(residency.bytes(AtlasTextureKind::Bc7Thumbnail), 64);
+        assert_eq!(residency.remove(&icon_new), Some(32));
+        assert_eq!(residency.bytes(AtlasTextureKind::Bc7Icon), 16);
+        assert_eq!(residency.entries(AtlasTextureKind::Bc7Icon), 1);
     }
 }

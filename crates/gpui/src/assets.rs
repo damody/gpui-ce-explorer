@@ -15,6 +15,10 @@ static BC7_ICON_GPU_USED: AtomicU64 = AtomicU64::new(0);
 static BC7_THUMBNAIL_GPU_USED: AtomicU64 = AtomicU64::new(0);
 static BC7_ICON_GPU_ENTRIES: AtomicU64 = AtomicU64::new(0);
 static BC7_THUMBNAIL_GPU_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static BC7_ICON_GPU_UPLOADS: AtomicU64 = AtomicU64::new(0);
+static BC7_THUMBNAIL_GPU_UPLOADS: AtomicU64 = AtomicU64::new(0);
+static BC7_ICON_GPU_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+static BC7_THUMBNAIL_GPU_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static BC7_GPU_CAPABILITY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Current compressed GPU cache usage for one ownership class.
@@ -26,6 +30,10 @@ pub struct CompressedGpuCacheStats {
     pub limit_bytes: u64,
     /// Number of resident GPU entries.
     pub entries: u64,
+    /// Successful direct BC7 block-row uploads.
+    pub uploads: u64,
+    /// LRU evictions caused by this ownership class exceeding its byte limit.
+    pub evictions: u64,
     /// `None` before adapter discovery, otherwise native BC7 sampling support.
     pub supported: Option<bool>,
 }
@@ -48,12 +56,16 @@ pub fn compressed_gpu_cache_stats() -> (CompressedGpuCacheStats, CompressedGpuCa
             bytes: BC7_ICON_GPU_USED.load(SeqCst),
             limit_bytes: BC7_ICON_GPU_LIMIT.load(SeqCst),
             entries: BC7_ICON_GPU_ENTRIES.load(SeqCst),
+            uploads: BC7_ICON_GPU_UPLOADS.load(SeqCst),
+            evictions: BC7_ICON_GPU_EVICTIONS.load(SeqCst),
             supported,
         },
         CompressedGpuCacheStats {
             bytes: BC7_THUMBNAIL_GPU_USED.load(SeqCst),
             limit_bytes: BC7_THUMBNAIL_GPU_LIMIT.load(SeqCst),
             entries: BC7_THUMBNAIL_GPU_ENTRIES.load(SeqCst),
+            uploads: BC7_THUMBNAIL_GPU_UPLOADS.load(SeqCst),
+            evictions: BC7_THUMBNAIL_GPU_EVICTIONS.load(SeqCst),
             supported,
         },
     )
@@ -84,6 +96,22 @@ pub fn record_compressed_gpu_cache(kind: CompressedRasterKind, bytes: u64, entri
             BC7_THUMBNAIL_GPU_ENTRIES.store(entries, SeqCst);
         }
     }
+}
+
+#[doc(hidden)]
+pub fn record_compressed_gpu_upload(kind: CompressedRasterKind) {
+    match kind {
+        CompressedRasterKind::Icon => BC7_ICON_GPU_UPLOADS.fetch_add(1, SeqCst),
+        CompressedRasterKind::Thumbnail => BC7_THUMBNAIL_GPU_UPLOADS.fetch_add(1, SeqCst),
+    };
+}
+
+#[doc(hidden)]
+pub fn record_compressed_gpu_eviction(kind: CompressedRasterKind) {
+    match kind {
+        CompressedRasterKind::Icon => BC7_ICON_GPU_EVICTIONS.fetch_add(1, SeqCst),
+        CompressedRasterKind::Thumbnail => BC7_THUMBNAIL_GPU_EVICTIONS.fetch_add(1, SeqCst),
+    };
 }
 
 /// A source of assets for this app to use.
@@ -271,6 +299,18 @@ impl fmt::Debug for RenderImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressed_gpu_instrumentation_is_independent_by_kind() {
+        let (icon_before, thumbnail_before) = compressed_gpu_cache_stats();
+        record_compressed_gpu_upload(CompressedRasterKind::Icon);
+        record_compressed_gpu_eviction(CompressedRasterKind::Thumbnail);
+        let (icon_after, thumbnail_after) = compressed_gpu_cache_stats();
+        assert_eq!(icon_after.uploads, icon_before.uploads + 1);
+        assert_eq!(icon_after.evictions, icon_before.evictions);
+        assert_eq!(thumbnail_after.uploads, thumbnail_before.uploads);
+        assert_eq!(thumbnail_after.evictions, thumbnail_before.evictions + 1);
+    }
     use smallvec::SmallVec;
 
     #[test]
