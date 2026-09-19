@@ -1378,9 +1378,8 @@ impl Window {
             cx.foreground_executor()
                 .spawn(async move {
                     while activation_receiver.recv().await.is_ok() {
-                        handle
-                            .update(&mut async_cx, |_, window, _| window.refresh())
-                            .log_err();
+                        // The window may already be gone (startup splash, closed popups).
+                        let _ = handle.update(&mut async_cx, |_, window, _| window.refresh());
                     }
                 })
                 .detach();
@@ -1389,9 +1388,7 @@ impl Window {
             cx.foreground_executor()
                 .spawn(async move {
                     while deactivation_receiver.recv().await.is_ok() {
-                        handle
-                            .update(&mut async_cx, |_, window, _| window.refresh())
-                            .log_err();
+                        let _ = handle.update(&mut async_cx, |_, window, _| window.refresh());
                     }
                 })
                 .detach();
@@ -1400,11 +1397,9 @@ impl Window {
             cx.foreground_executor()
                 .spawn(async move {
                     while let Ok(request) = action_receiver.recv().await {
-                        handle
-                            .update(&mut async_cx, |_, window, cx| {
-                                window.handle_a11y_action(request, cx);
-                            })
-                            .log_err();
+                        let _ = handle.update(&mut async_cx, |_, window, cx| {
+                            window.handle_a11y_action(request, cx);
+                        });
                     }
                 })
                 .detach();
