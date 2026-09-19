@@ -63,7 +63,7 @@ impl WindowsWindowInner {
             WM_DESTROY => self.handle_destroy_msg(handle),
             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
             WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
-            WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
+            WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, wparam, lparam),
             // Treat double click as a second single click, since we track the double clicks ourselves.
             // If you don't interact with any elements, this will fall through to the windows default
             // behavior of toggling whether the window is maximized.
@@ -938,41 +938,40 @@ impl WindowsWindowInner {
             return drag_area;
         }
 
-        let dpi = unsafe { GetDpiForWindow(handle) };
-        // We do not use the OS title bar, so the default `DefWindowProcW` will only register a 1px edge for resizes
-        // We need to calculate the frame thickness ourselves and do the hit test manually.
-        let frame_y = get_frame_thicknessx(dpi);
-        let frame_x = get_frame_thicknessy(dpi);
-        let mut cursor_point = POINT {
-            x: lparam.signed_loword().into(),
-            y: lparam.signed_hiword().into(),
-        };
-
-        unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
-        if !self.state.is_maximized() && 0 <= cursor_point.y && cursor_point.y <= frame_y {
-            // x-axis actually goes from -frame_x to 0
-            return Some(if cursor_point.x <= 0 {
-                HTTOPLEFT
-            } else {
-                let mut rect = Default::default();
-                unsafe { GetWindowRect(handle, &mut rect) }.log_err();
-                // right and bottom bounds of RECT are exclusive, thus `-1`
-                let right = rect.right - rect.left - 1;
-                // the bounds include the padding frames, so accommodate for both of them
-                if right - 2 * frame_x <= cursor_point.x {
-                    HTTOPRIGHT
-                } else {
-                    HTTOP
-                }
-            } as _);
+        if !self.state.is_maximized() {
+            let dpi = unsafe { GetDpiForWindow(handle) };
+            // Without an OS title bar, DefWindowProcW only keeps a 1px resize edge.
+            // Hit-test all four edges and four corners with the real frame thickness
+            // before falling back to the caption drag region.
+            let frame_x = get_frame_thicknessx(dpi);
+            let frame_y = get_frame_thicknessy(dpi);
+            let mut window_rect = RECT::default();
+            unsafe { GetWindowRect(handle, &mut window_rect) }.log_err();
+            if let Some(hit) = resize_border_hit(
+                lparam.signed_loword().into(),
+                lparam.signed_hiword().into(),
+                window_rect,
+                frame_x,
+                frame_y,
+            ) {
+                return Some(hit as _);
+            }
         }
 
         drag_area
     }
 
-    fn handle_nc_mouse_move_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+    fn handle_nc_mouse_move_msg(
+        &self,
+        handle: HWND,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<isize> {
         self.start_tracking_mouse(handle, TME_LEAVE | TME_NONCLIENT);
         self.restore_cursor_after_hide();
+        if is_resize_hit(wparam.0 as u32) {
+            return None;
+        }
 
         let mut func = self.state.callbacks.input.take()?;
         let scale_factor = self.state.scale_factor.get();
@@ -1000,6 +999,9 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<isize> {
+        if button == MouseButton::Left && is_resize_hit(wparam.0 as u32) {
+            return None;
+        }
         if let Some(mut func) = self.state.callbacks.input.take() {
             let scale_factor = self.state.scale_factor.get();
             let mut cursor_point = POINT {
@@ -1047,6 +1049,9 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<isize> {
+        if button == MouseButton::Left && is_resize_hit(wparam.0 as u32) {
+            return None;
+        }
         if let Some(mut func) = self.state.callbacks.input.take() {
             let scale_factor = self.state.scale_factor.get();
 
@@ -1680,6 +1685,34 @@ pub(crate) fn current_capslock() -> Capslock {
 // borders on Windows:
 // - SM_CXSIZEFRAME: The resize handle.
 // - SM_CXPADDEDBORDER: Additional border space that isn't part of the resize handle.
+fn is_resize_hit(hit: u32) -> bool {
+    matches!(
+        hit,
+        HTLEFT | HTRIGHT | HTTOP | HTTOPLEFT | HTTOPRIGHT | HTBOTTOM | HTBOTTOMLEFT | HTBOTTOMRIGHT
+    )
+}
+
+fn resize_border_hit(x: i32, y: i32, window: RECT, frame_x: i32, frame_y: i32) -> Option<u32> {
+    if frame_x <= 0 || frame_y <= 0 {
+        return None;
+    }
+    let on_left = x >= window.left && x < window.left + frame_x;
+    let on_right = x < window.right && x >= window.right - frame_x;
+    let on_top = y >= window.top && y < window.top + frame_y;
+    let on_bottom = y < window.bottom && y >= window.bottom - frame_y;
+    match (on_left, on_right, on_top, on_bottom) {
+        (true, false, true, false) => Some(HTTOPLEFT),
+        (false, true, true, false) => Some(HTTOPRIGHT),
+        (true, false, false, true) => Some(HTBOTTOMLEFT),
+        (false, true, false, true) => Some(HTBOTTOMRIGHT),
+        (false, false, true, false) => Some(HTTOP),
+        (false, false, false, true) => Some(HTBOTTOM),
+        (true, false, false, false) => Some(HTLEFT),
+        (false, true, false, false) => Some(HTRIGHT),
+        _ => None,
+    }
+}
+
 fn get_frame_thicknessx(dpi: u32) -> i32 {
     let resize_frame_thickness = unsafe { GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) };
     let padding_thickness = unsafe { GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi) };
@@ -1690,6 +1723,59 @@ fn get_frame_thicknessy(dpi: u32) -> i32 {
     let resize_frame_thickness = unsafe { GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) };
     let padding_thickness = unsafe { GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi) };
     resize_frame_thickness + padding_thickness
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RECT, resize_border_hit};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    };
+
+    fn window() -> RECT {
+        RECT {
+            left: 100,
+            top: 200,
+            right: 500,
+            bottom: 600,
+        }
+    }
+
+    #[test]
+    fn resize_hit_covers_every_edge_and_corner() {
+        let rect = window();
+        let frame = 8;
+        assert_eq!(
+            resize_border_hit(100, 200, rect, frame, frame),
+            Some(HTTOPLEFT)
+        );
+        assert_eq!(resize_border_hit(300, 200, rect, frame, frame), Some(HTTOP));
+        assert_eq!(
+            resize_border_hit(499, 200, rect, frame, frame),
+            Some(HTTOPRIGHT)
+        );
+        assert_eq!(
+            resize_border_hit(100, 400, rect, frame, frame),
+            Some(HTLEFT)
+        );
+        assert_eq!(
+            resize_border_hit(499, 400, rect, frame, frame),
+            Some(HTRIGHT)
+        );
+        assert_eq!(
+            resize_border_hit(100, 599, rect, frame, frame),
+            Some(HTBOTTOMLEFT)
+        );
+        assert_eq!(
+            resize_border_hit(300, 599, rect, frame, frame),
+            Some(HTBOTTOM)
+        );
+        assert_eq!(
+            resize_border_hit(499, 599, rect, frame, frame),
+            Some(HTBOTTOMRIGHT)
+        );
+        assert_eq!(resize_border_hit(300, 400, rect, frame, frame), None);
+    }
 }
 
 fn notify_frame_changed(handle: HWND) {
