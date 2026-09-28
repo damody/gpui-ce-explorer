@@ -14,10 +14,9 @@
 
 use std::sync::atomic::Ordering;
 
-use anyhow::Error;
 use gpui::{DevicePixels, Size};
 
-use crate::{DirectXDevices, DirectXRenderer, WindowsWindowInner};
+use crate::{DirectXDevices, DirectXRenderer, WindowsWindowInner, record_isolated_failure};
 
 /// How many times in a row a window asks the platform for new devices before it gives up.
 const MAX_FAILED_RECOVERIES: u32 = 5;
@@ -105,7 +104,8 @@ pub(crate) fn recover(window: &WindowsWindowInner, devices: &DirectXDevices) -> 
         renderer.fast_recovery.failed_recoveries,
     );
     if !retry {
-        recovery_failed(error);
+        record_isolated_failure("gpui", "device_lost", &format!("Device lost: {error:#}"));
+        return false;
     }
     drop(renderer);
     window
@@ -124,11 +124,6 @@ pub(crate) fn can_draw(renderer: &DirectXRenderer) -> bool {
             .resources
             .as_ref()
             .is_some_and(|resources| resources.render_target_view.is_some())
-}
-
-/// Panics with the whole chain of `error`, which names the step that failed and its `HRESULT`.
-pub(crate) fn recovery_failed(error: Error) -> ! {
-    panic!("Device lost: {error:#}");
 }
 
 fn is_device_lost(renderer: &DirectXRenderer) -> bool {

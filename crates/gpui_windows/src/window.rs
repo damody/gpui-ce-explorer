@@ -1654,10 +1654,12 @@ unsafe extern "system" fn window_procedure(
     }
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
-        if msg == WM_NCDESTROY {
-            inner.dialog_owner.close();
-        }
-        inner.handle_msg(hwnd, msg, wparam, lparam)
+        isolate_window_message(hwnd, msg, wparam, lparam, || {
+            if msg == WM_NCDESTROY {
+                inner.dialog_owner.close();
+            }
+            inner.handle_msg(hwnd, msg, wparam, lparam)
+        })
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     };
