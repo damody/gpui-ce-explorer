@@ -1,6 +1,7 @@
 #![cfg(target_os = "windows")]
 
 mod clipboard;
+mod crash_log;
 mod destination_list;
 mod direct_manipulation;
 #[cfg(not(feature = "wgpu"))]
@@ -23,6 +24,7 @@ mod window;
 mod wrapper;
 
 pub(crate) use clipboard::*;
+pub(crate) use crash_log::{isolate_window_message, record_isolated_failure};
 pub(crate) use destination_list::*;
 #[cfg(not(feature = "wgpu"))]
 pub(crate) use direct_write::*;

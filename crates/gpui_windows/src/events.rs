@@ -1228,7 +1228,7 @@ impl WindowsWindowInner {
                 .borrow_mut()
                 .handle_device_lost(&devices)
             {
-                panic!("Device lost: {err}");
+                record_isolated_failure("gpui", "device_lost", &format!("Device lost: {err}"));
             }
         }
         #[cfg(feature = "wgpu")]
@@ -1237,7 +1237,7 @@ impl WindowsWindowInner {
             if let Err(err) = self.state.renderer.borrow_mut().recover(&RawWindow {
                 hwnd: self.platform_window_handle,
             }) {
-                panic!("Device lost: {err}");
+                record_isolated_failure("gpui", "device_lost", &format!("Device lost: {err}"));
             }
         }
         // Make sure the first `draw_window` after recovery (whether it comes
