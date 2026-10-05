@@ -501,6 +501,9 @@ impl WindowsWindow {
             let dwexstyle = if params.kind == WindowKind::Dialog {
                 dwstyle |= WS_POPUP | WS_CAPTION;
                 WS_EX_DLGMODALFRAME
+            } else if std::env::var_os("SUPEREXPLORER_BACKGROUND").is_some() {
+                // Monkey and other background launches must not become the foreground window.
+                WS_EX_APPWINDOW | WS_EX_NOACTIVATE
             } else {
                 WS_EX_APPWINDOW
             };
@@ -570,7 +573,7 @@ impl WindowsWindow {
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
         this.state.border_offset.update(hwnd)?;
-        let placement = retrieve_window_placement(
+        let mut placement = retrieve_window_placement(
             hwnd,
             display,
             params.bounds,
@@ -578,6 +581,9 @@ impl WindowsWindow {
             &this.state.border_offset,
         )?;
         if params.show {
+            if std::env::var_os("SUPEREXPLORER_BACKGROUND").is_some() {
+                placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+            }
             unsafe { SetWindowPlacement(hwnd, &placement)? };
         } else {
             this.state.initial_placement.set(Some(WindowOpenStatus {
