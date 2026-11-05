@@ -5348,11 +5348,23 @@ impl Window {
         let params = RenderImageParams {
             image_id: data.id,
             frame_index,
+            compressed_bc7_srgb: data.compressed_raster().map(|raster| raster.kind),
         };
 
-        let tile = self
-            .sprite_atlas
-            .get_or_insert_with(params.into(), &mut || {
+        let key = params.into();
+        let tile = if let Some(compressed) = data.compressed_raster() {
+            self.sprite_atlas.get_or_insert_bc7(
+                &key,
+                data.size(frame_index),
+                size(
+                    compressed.padded_width.into(),
+                    compressed.padded_height.into(),
+                ),
+                compressed.row_pitch,
+                &compressed.blocks,
+            )?
+        } else {
+            self.sprite_atlas.get_or_insert_with(key, &mut || {
                 Ok(Some((
                     data.size(frame_index),
                     Cow::Borrowed(
@@ -5361,7 +5373,8 @@ impl Window {
                     ),
                 )))
             })?
-            .expect("Callback above only returns Some");
+        }
+        .expect("Callback above only returns Some");
 
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 
@@ -5453,6 +5466,7 @@ impl Window {
             let params = RenderImageParams {
                 image_id: data.id,
                 frame_index,
+                compressed_bc7_srgb: data.compressed_raster().map(|raster| raster.kind),
             };
 
             self.sprite_atlas.remove(&params.clone().into());
@@ -5470,6 +5484,7 @@ impl Window {
                     &RenderImageParams {
                         image_id: data.id,
                         frame_index,
+                        compressed_bc7_srgb: data.compressed_raster().map(|raster| raster.kind),
                     }
                     .into(),
                 )

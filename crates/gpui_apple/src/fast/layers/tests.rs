@@ -876,6 +876,7 @@ fn image_tile(harness: &Harness) -> AtlasTile {
     let key = AtlasKey::Image(RenderImageParams {
         image_id: ImageId(9_999),
         frame_index: 0,
+        compressed_bc7_srgb: None,
     });
     let bytes: Vec<u8> = (0..20 * 20)
         .flat_map(|i: u32| {

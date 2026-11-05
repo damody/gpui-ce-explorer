@@ -82,7 +82,9 @@ impl AtlasBackend for MetalAtlasTextures {
         let textures = match id.kind {
             AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
             AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
-            AtlasTextureKind::Subpixel => unreachable!(),
+            AtlasTextureKind::Subpixel
+            | AtlasTextureKind::Bc7Icon
+            | AtlasTextureKind::Bc7Thumbnail => unreachable!(),
         };
 
         let Some(texture_slot) = textures
@@ -115,7 +117,9 @@ impl MetalAtlasTextures {
             let textures = match texture_kind {
                 AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
                 AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
-                AtlasTextureKind::Subpixel => unreachable!(),
+                AtlasTextureKind::Subpixel
+            | AtlasTextureKind::Bc7Icon
+            | AtlasTextureKind::Bc7Thumbnail => unreachable!(),
             };
 
             if let Some(tile) = textures
@@ -163,7 +167,9 @@ impl MetalAtlasTextures {
                 pixel_format = MTLPixelFormat::BGRA8Unorm;
                 usage = MTLTextureUsage::ShaderRead;
             }
-            AtlasTextureKind::Subpixel => unreachable!(),
+            AtlasTextureKind::Subpixel
+            | AtlasTextureKind::Bc7Icon
+            | AtlasTextureKind::Bc7Thumbnail => unreachable!(),
         }
         texture_descriptor.setPixelFormat(pixel_format);
         texture_descriptor.setUsage(usage);
@@ -182,7 +188,9 @@ impl MetalAtlasTextures {
         let texture_list = match kind {
             AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
             AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
-            AtlasTextureKind::Subpixel => unreachable!(),
+            AtlasTextureKind::Subpixel
+            | AtlasTextureKind::Bc7Icon
+            | AtlasTextureKind::Bc7Thumbnail => unreachable!(),
         };
 
         let index = texture_list.free_list.pop().unwrap_or_else(|| {
@@ -208,7 +216,9 @@ impl MetalAtlasTextures {
         let textures = match id.kind {
             AtlasTextureKind::Monochrome => &self.monochrome_textures,
             AtlasTextureKind::Polychrome => &self.polychrome_textures,
-            AtlasTextureKind::Subpixel => unreachable!(),
+            AtlasTextureKind::Subpixel
+            | AtlasTextureKind::Bc7Icon
+            | AtlasTextureKind::Bc7Thumbnail => unreachable!(),
         };
         textures.textures.get(id.index as usize)?.as_ref()
     }
@@ -304,7 +314,9 @@ impl<'a> AtlasUpload<'a> {
         let bytes_per_pixel = match kind {
             AtlasTextureKind::Monochrome => 1,
             AtlasTextureKind::Polychrome => 4,
-            AtlasTextureKind::Subpixel => unreachable!(),
+            AtlasTextureKind::Subpixel
+            | AtlasTextureKind::Bc7Icon
+            | AtlasTextureKind::Bc7Thumbnail => unreachable!(),
         };
         let bytes_per_row = (size.width.0 as usize)
             .checked_mul(bytes_per_pixel)
@@ -557,6 +569,7 @@ mod tests {
         AtlasKey::Image(gpui::RenderImageParams {
             image_id: gpui::ImageId(image_id),
             frame_index,
+            compressed_bc7_srgb: None,
         })
     }
 

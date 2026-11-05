@@ -1787,6 +1787,16 @@ impl AtlasKey {
                 }
             }
             AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
+            AtlasKey::Image(params)
+                if params.compressed_bc7_srgb == Some(crate::CompressedRasterKind::Icon) =>
+            {
+                AtlasTextureKind::Bc7Icon
+            }
+            AtlasKey::Image(params)
+                if params.compressed_bc7_srgb == Some(crate::CompressedRasterKind::Thumbnail) =>
+            {
+                AtlasTextureKind::Bc7Thumbnail
+            }
             AtlasKey::Image(_) => AtlasTextureKind::Polychrome,
         }
     }
@@ -1818,6 +1828,19 @@ pub trait PlatformAtlas {
         key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
+
+    /// Inserts a validated BC7 raster. Backends without native support fail closed.
+    fn get_or_insert_bc7(
+        &self,
+        _key: &AtlasKey,
+        _size: Size<DevicePixels>,
+        _padded_size: Size<DevicePixels>,
+        _row_pitch: u32,
+        _blocks: &[u8],
+    ) -> Result<Option<AtlasTile>> {
+        anyhow::bail!("BC7 textures are unsupported by this backend")
+    }
+
     fn remove(&self, key: &AtlasKey);
 
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
@@ -1854,6 +1877,15 @@ impl<Backend> AtlasState<Backend> {
 
     pub fn contains(&self, key: &AtlasKey) -> bool {
         self.tiles_by_key.contains_key(key)
+    }
+
+    pub fn get(&self, key: &AtlasKey) -> Option<AtlasTile> {
+        self.tiles_by_key.get(key).copied()
+    }
+
+    /// Records a tile the backend allocated outside `get_or_insert_with`.
+    pub fn insert_tile(&mut self, key: AtlasKey, tile: AtlasTile) {
+        self.tiles_by_key.insert(key, tile);
     }
 
     pub fn clear(&mut self, reset_backend: impl FnOnce(&mut Backend)) {
@@ -2031,6 +2063,8 @@ pub enum AtlasTextureKind {
     Monochrome = 0,
     Polychrome = 1,
     Subpixel = 2,
+    Bc7Icon = 3,
+    Bc7Thumbnail = 4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -3670,6 +3704,7 @@ mod atlas_tests {
         AtlasKey::Image(RenderImageParams {
             image_id: crate::ImageId(image_id),
             frame_index: 0,
+            compressed_bc7_srgb: None,
         })
     }
 
