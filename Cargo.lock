@@ -3601,6 +3601,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_elements"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui_platform",
+ "smallvec",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "gpui_ios"
 version = "0.1.0"
 dependencies = [

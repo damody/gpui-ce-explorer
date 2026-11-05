@@ -67,6 +67,30 @@ impl KeyBinding {
         )
     }
 
+    /// Loads a binding without an `App`, resolving `secondary-` for the OS this build targets.
+    pub(crate) fn load_for_host_os(
+        keystrokes: &str,
+        action: Box<dyn Action>,
+        context_predicate: Option<Rc<KeyBindingContextPredicate>>,
+    ) -> std::result::Result<Self, InvalidKeystrokeError> {
+        let os = if cfg!(target_os = "macos") {
+            crate::OperatingSystem::Mac
+        } else if cfg!(target_os = "windows") {
+            crate::OperatingSystem::Windows
+        } else {
+            crate::OperatingSystem::Linux
+        };
+        Self::load_internal(
+            keystrokes,
+            action,
+            context_predicate,
+            false,
+            None,
+            &DummyKeyboardMapper,
+            |source| Keystroke::parse_with_os(source, os),
+        )
+    }
+
     fn load_internal<'a>(
         keystrokes: &'a str,
         action: Box<dyn Action>,

@@ -2,7 +2,7 @@ use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextRun,
-    TextStyle, TooltipId, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
+    TextOverflow, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
     set_tooltip_on_window,
 };
 use anyhow::Context as _;
@@ -630,7 +630,119 @@ pub(crate) struct TextLayoutInner {
     pub(crate) bounds: Option<Bounds<Pixels>>,
 }
 
+/// Metadata about how text should be truncated. Generated during text layout via `TextLayout::evaluate_overflow`.
+pub struct TextLayoutTruncation {
+    /// The width that the text can occupy before it is truncated.
+    pub width: Option<Pixels>,
+    /// The text to affix to the displayed text if truncating (e.g. an ellipsis `...`).
+    pub affix: SharedString,
+    /// What side of the text will be truncated if it does not fit.
+    pub source: TruncateFrom,
+}
+
+impl TextLayoutTruncation {
+    /// Creates a truncation by using the overflow as the affix, given the provided width.
+    fn overflow_width(text_overflow: TextOverflow, width: Option<Pixels>) -> Self {
+        let (affix, source) = match text_overflow {
+            TextOverflow::Truncate(affix) => (affix, TruncateFrom::End),
+            TextOverflow::TruncateStart(affix) => (affix, TruncateFrom::Start),
+            TextOverflow::TruncateMiddle(affix) => (affix, TruncateFrom::Middle),
+        };
+        TextLayoutTruncation {
+            width,
+            affix,
+            source,
+        }
+    }
+}
+
 impl TextLayout {
+    /// Evaluates the width to wrap the text at.
+    pub fn evaluate_wrap_width(
+        white_space: &WhiteSpace,
+        known_dimensions: Size<Option<Pixels>>,
+        available_space: Size<crate::AvailableSpace>,
+    ) -> Option<Pixels> {
+        use crate::AvailableSpace::*;
+        match white_space {
+            // Text does not wrap, no max width
+            WhiteSpace::Nowrap => None,
+            // If the text wraps, return the already calculated width.
+            WhiteSpace::Normal => known_dimensions.width.or(match available_space.width {
+                // Otherwise if the available space is a concrete value, then that is the width to wrap to.
+                Definite(x) => Some(x),
+                // If the wrapping is content-based, then there is no wrapping of text.
+                MaxContent | MinContent => None,
+            }),
+        }
+    }
+
+    /// Evaluates how truncation should be applied if the text overflows the available space.
+    pub fn evaluate_overflow(
+        text_style: &TextStyle,
+        known_dimensions: Size<Option<Pixels>>,
+        available_space: Size<crate::AvailableSpace>,
+    ) -> TextLayoutTruncation {
+        match text_style.text_overflow.clone() {
+            Some(text_overflow) => {
+                // Calculate the desired width, prioritizing the calculated dimensions,
+                // falling back on calculating a width from the available space and
+                // number of lines to clamp to via text style.
+                let width = known_dimensions.width.or(match available_space.width {
+                    crate::AvailableSpace::Definite(x) => match text_style.line_clamp {
+                        Some(max_lines) => Some(x * max_lines),
+                        None => Some(x),
+                    },
+                    _ => None,
+                });
+
+                TextLayoutTruncation::overflow_width(text_overflow, width)
+            }
+            None => TextLayoutTruncation {
+                width: None,
+                affix: SharedString::default(),
+                source: TruncateFrom::End,
+            },
+        }
+    }
+
+    /// Conditionally applies truncation to some text and outputs how the text should be displayed.
+    pub fn apply_truncation<'runs>(
+        text: SharedString,
+        text_style: &TextStyle,
+        font_size: Pixels,
+        wrap_width: Option<Pixels>,
+        truncation: &TextLayoutTruncation,
+        runs: &'runs [TextRun],
+        cx: &mut App,
+    ) -> (SharedString, Cow<'runs, [TextRun]>) {
+        let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
+        if truncation.width.is_some() {
+            if let Some(max_lines) = text_style.line_clamp
+                && let Some(wrap_width) = wrap_width
+            {
+                line_wrapper.truncate_wrapped_line(
+                    text,
+                    wrap_width,
+                    max_lines,
+                    &truncation.affix,
+                    runs,
+                    truncation.source,
+                )
+            } else {
+                line_wrapper.truncate_line(
+                    text,
+                    truncation.width.unwrap_or(Pixels::MAX),
+                    &truncation.affix,
+                    runs,
+                    truncation.source,
+                )
+            }
+        } else {
+            (text, Cow::Borrowed(runs))
+        }
+    }
+
     fn layout(
         &self,
         text: SharedString,

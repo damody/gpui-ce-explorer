@@ -90,6 +90,33 @@ impl<T: 'static> DragMoveEvent<T> {
 }
 
 impl Interactivity {
+    /// Assigns the current scroll offset of an element. No-op if the element's
+    /// style does not have overflow enabled.
+    ///
+    /// Should only be called during the `request_layout` phase.
+    pub fn set_scroll_offset(
+        &self,
+        global_id: Option<&GlobalElementId>,
+        window: &mut Window,
+        point: Point<Pixels>,
+    ) {
+        window.with_optional_element_state::<InteractiveElementState, _>(
+            global_id,
+            |element_state, _window| {
+                let mut element_state =
+                    element_state.map(|element_state| element_state.unwrap_or_default());
+                let overflow = &self.base_style.overflow;
+                if (overflow.x == Some(Overflow::Scroll) || overflow.y == Some(Overflow::Scroll))
+                    && let Some(element_state) = element_state.as_mut()
+                {
+                    let scroll_offset = element_state.scroll_offset.get_or_insert_with(Rc::default);
+                    *scroll_offset.borrow_mut() = point;
+                }
+                ((), element_state)
+            },
+        );
+    }
+
     /// Create an `Interactivity`, capturing the caller location in debug mode.
     #[cfg(any(feature = "inspector", debug_assertions))]
     #[track_caller]
