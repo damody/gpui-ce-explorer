@@ -1843,6 +1843,11 @@ pub trait PlatformAtlas {
 
     fn remove(&self, key: &AtlasKey);
 
+    /// Records the tiles the frame just finished refers to. A retained view can
+    /// draw that frame's primitives again without asking the atlas for them, so a
+    /// backend that evicts on its own must keep these tiles until the next frame.
+    fn retain_frame_tiles(&self, _tiles: &mut dyn Iterator<Item = AtlasTile>) {}
+
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false

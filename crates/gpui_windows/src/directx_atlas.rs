@@ -1,4 +1,4 @@
-use collections::FxHashMap;
+use collections::{FxHashMap, FxHashSet};
 use etagere::BucketedAtlasAllocator;
 use parking_lot::Mutex;
 use windows::Win32::Graphics::{
@@ -32,6 +32,10 @@ struct DirectXAtlasTextures {
 struct Bc7Residency {
     costs: FxHashMap<AtlasKey, u64>,
     last_used: FxHashMap<AtlasKey, u64>,
+    keys_by_tile: FxHashMap<(AtlasTextureId, u32), AtlasKey>,
+    /// Keys the last finished frame drew. Retained views replay those primitives
+    /// without touching the atlas, so eviction must leave their pixels in place.
+    frame_keys: FxHashSet<AtlasKey>,
     clock: u64,
 }
 
@@ -166,8 +170,10 @@ impl PlatformAtlas for DirectXAtlas {
             .saturating_add(blocks.len() as u64)
             > limit
         {
+            // Everything left is on screen: run over budget until the next frame
+            // rather than overwrite pixels a replayed primitive still samples.
             let Some(victim) = lock.backend.bc7_residency.least_recent(kind) else {
-                anyhow::bail!("BC7 GPU cache budget is full");
+                break;
             };
             Self::remove_key(&mut lock, &victim, true);
         }
@@ -191,12 +197,23 @@ impl PlatformAtlas for DirectXAtlas {
         lock.backend
             .bc7_residency
             .insert(key.clone(), blocks.len() as u64);
+        lock.backend
+            .bc7_residency
+            .bind_tile(key.clone(), tile_identity(&tile));
         lock.backend.publish_bc7_stats();
         Ok(Some(tile))
     }
 
     fn remove(&self, key: &AtlasKey) {
         Self::remove_key(&mut self.0.lock(), key, false);
+    }
+
+    fn retain_frame_tiles(&self, tiles: &mut dyn Iterator<Item = AtlasTile>) {
+        self.0
+            .lock()
+            .backend
+            .bc7_residency
+            .retain_frame(tiles.map(|tile| tile_identity(&tile)));
     }
 }
 
@@ -581,10 +598,26 @@ impl Bc7Residency {
         self.last_used.insert(key.clone(), self.clock);
     }
 
+    fn bind_tile(&mut self, key: AtlasKey, tile: (AtlasTextureId, u32)) {
+        self.keys_by_tile.insert(tile, key);
+    }
+
+    fn retain_frame(&mut self, tiles: impl Iterator<Item = (AtlasTextureId, u32)>) {
+        self.frame_keys.clear();
+        if self.keys_by_tile.is_empty() {
+            return;
+        }
+        for tile in tiles {
+            if let Some(key) = self.keys_by_tile.get(&tile) {
+                self.frame_keys.insert(key.clone());
+            }
+        }
+    }
+
     fn least_recent(&self, kind: AtlasTextureKind) -> Option<AtlasKey> {
         self.last_used
             .iter()
-            .filter(|(key, _)| key.texture_kind() == kind)
+            .filter(|(key, _)| key.texture_kind() == kind && !self.frame_keys.contains(*key))
             .min_by_key(|(_, last_used)| **last_used)
             .map(|(key, _)| key.clone())
     }
@@ -606,8 +639,14 @@ impl Bc7Residency {
 
     fn remove(&mut self, key: &AtlasKey) -> Option<u64> {
         self.last_used.remove(key);
+        self.frame_keys.remove(key);
+        self.keys_by_tile.retain(|_, bound| bound != key);
         self.costs.remove(key)
     }
+}
+
+fn tile_identity(tile: &AtlasTile) -> (AtlasTextureId, u32) {
+    (tile.texture_id, tile.tile_id.0)
 }
 
 #[cfg(test)]
@@ -667,6 +706,42 @@ mod tests {
             frame_index: 0,
             compressed_bc7_srgb: Some(kind),
         })
+    }
+
+    #[test]
+    fn eviction_skips_tiles_the_last_frame_drew() {
+        let texture = AtlasTextureId {
+            index: 0,
+            kind: AtlasTextureKind::Bc7Thumbnail,
+        };
+        let replayed = bc7_key(1, CompressedRasterKind::Thumbnail);
+        let offscreen = bc7_key(2, CompressedRasterKind::Thumbnail);
+        let mut residency = Bc7Residency::default();
+        residency.insert(replayed.clone(), 16);
+        residency.bind_tile(replayed.clone(), (texture, 1));
+        residency.insert(offscreen.clone(), 16);
+        residency.bind_tile(offscreen.clone(), (texture, 2));
+
+        residency.retain_frame([(texture, 1)].into_iter());
+        assert!(
+            residency
+                .least_recent(AtlasTextureKind::Bc7Thumbnail)
+                .is_some_and(|key| key == offscreen)
+        );
+
+        residency.retain_frame([(texture, 1), (texture, 2)].into_iter());
+        assert!(
+            residency
+                .least_recent(AtlasTextureKind::Bc7Thumbnail)
+                .is_none()
+        );
+
+        residency.retain_frame(std::iter::empty());
+        assert!(
+            residency
+                .least_recent(AtlasTextureKind::Bc7Thumbnail)
+                .is_some_and(|key| key == replayed)
+        );
     }
 
     #[test]
