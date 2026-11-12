@@ -829,7 +829,7 @@ impl<'app> EditableTextActionHandler<Context<'app, Self>> for EditableTextState 
         self.selected_range = 0.into();
         cx.notify();
 
-        window.blur();
+        window.blur(cx);
     }
 
     fn insert_enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<'app, Self>) {

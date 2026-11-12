@@ -1,105 +1,178 @@
-# Publish to crates on a version tag push
 name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'release.toml'
+      - 'script/prepare-release.ts'
+      - 'script/publish-release.ts'
+      - 'script/release-common.ts'
+      - 'script/release.test.ts'
+      - 'LICENSE'
+      - 'docs/releasing.md'
   workflow_dispatch:
     inputs:
+      tag:
+        description: 'Existing release tag (first release: v0.1.0)'
+        required: true
+        type: string
       dry_run:
-        description: 'Dry run (no actual publish)'
-        required: false
-        default: 'false'
+        description: 'Validate without uploading to crates.io'
+        default: true
+        type: boolean
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+permissions:
+  contents: read
+
+concurrency:
+  group: release-validation-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # Determine pre-release status
-  prerelease:
-    runs-on: ubuntu-latest
-    outputs:
-      value:   ${{ steps.check.outputs.value }}
-      version: ${{ steps.check.outputs.version }}
+  validate:
+    name: Validate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - id: check
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          if [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "value=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=true"  >> "$GITHUB_OUTPUT"
-          fi
-
-  # Run full CI on the tag via justfile
-  verify:
-    needs: [prerelease]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Install system deps
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Require a tag on main
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          git merge-base --is-ancestor HEAD origin/main
+
+      - name: Check upstream constraints
+        if: runner.os == 'Linux'
+        run: python3 script/check-upstream
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+
+      - name: Prepare release manifests
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || (github.event_name == 'push' && github.ref_name) || 'v0.999.0' }}
+        run: |
+          bun script/prepare-release.ts --tag "$RELEASE_TAG"
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libxkbcommon-dev libwayland-dev libx11-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev
-      - uses: hustcer/setup-nu@v3
-      - uses: extractions/setup-just@v2
-      - run: just fmt-check
-      - run: just clippy
-      - run: just build
-      - run: just test
-      - run: just test-doc
+            build-essential pkg-config \
+            libasound2-dev libfontconfig-dev libfreetype-dev libssl-dev \
+            libvulkan1 libwayland-dev libx11-xcb-dev libxcb1-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libzstd-dev
 
-  # Verify packages are publishable
-  verify-publish:
-    needs: [prerelease, verify]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install Rust
+        run: rustup show
+
+      - name: Test release dependency updates
+        run: bun test --timeout 60000 script/release.test.ts
+
       - uses: Swatinem/rust-cache@v2
-      - name: Dry-run publish check
+        with:
+          workspaces: target/release-workspace
+
+      - name: Check registry-only release dependencies
         run: |
-          for crate in crates/gpui_shared_string crates/gpui_macros crates/gpui crates/gpui_wgpu crates/gpui_tokio crates/gpui_platform; do
-            echo "Checking $crate..."
-            cargo publish --dry-run --manifest-path "$crate/Cargo.toml" 2>&1 | head -5
-          done
+          cargo check --manifest-path target/release-workspace/Cargo.toml --workspace --lib
+          cargo check --manifest-path target/release-workspace/Cargo.toml --workspace --lib --all-features
 
-  # Publish to crates.io
+      - name: Check Web backend
+        if: runner.os == 'Linux'
+        run: |
+          rustup toolchain install nightly --profile minimal --target wasm32-unknown-unknown
+          cargo +nightly check --manifest-path target/release-workspace/Cargo.toml -p gpui-fast-web --lib --target wasm32-unknown-unknown
+
+      - name: Validate package contents and release order
+        run: bun script/publish-release.ts
+
+      - name: Rehearse publication without uploading
+        run: bun script/publish-release.ts --dry-run
+
+      - name: Upload rehearsed crate archives
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-crates
+          path: target/release-workspace/target/package/tmp-crate/*.crate
+          if-no-files-found: error
+
+      - name: Upload prepared release
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-workspace
+          path: |
+            target/release-workspace/*/Cargo.toml
+            target/release-workspace/*/README.md
+            target/release-workspace/*/LICENSE
+            target/release-workspace/*/NOTICE
+            target/release-workspace/*/build.rs
+            target/release-workspace/*/src
+            target/release-workspace/*/resources
+            target/release-workspace/Cargo.toml
+            target/release-workspace/Cargo.lock
+            target/release-workspace/rust-toolchain.toml
+
   publish:
-    needs: [prerelease, verify-publish]
+    name: Publish to crates.io
+    needs: validate
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
     runs-on: ubuntu-latest
-    if: github.event_name != 'workflow_dispatch' || github.event.inputs.dry_run != 'true'
+    concurrency:
+      group: crates-io-publish
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-workspace
+          path: target/release-workspace
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            libasound2-dev libfontconfig-dev libfreetype-dev libssl-dev \
+            libvulkan1 libwayland-dev libx11-xcb-dev libxcb1-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libzstd-dev
+
+      - name: Install Rust
+        run: rustup show
+
       - uses: Swatinem/rust-cache@v2
-      - uses: hustcer/setup-nu@v3
-      - uses: extractions/setup-just@v2
-      - run: just publish
+        with:
+          workspaces: target/release-workspace
+
+      - name: Publish in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  # Create GitHub Release
-  github-release:
-    needs: [prerelease, publish]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: softprops/action-gh-release@v2
-        with:
-          draft: true
-          prerelease: ${{ needs.prerelease.outputs.value }}
-          generate_release_notes: true
-          name: ${{ needs.prerelease.outputs.version }}
+        run: bun script/publish-release.ts --publish

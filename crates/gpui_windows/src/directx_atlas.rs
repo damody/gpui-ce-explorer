@@ -1,4 +1,4 @@
-use collections::FxHashMap;
+use collections::{FxHashMap, FxHashSet};
 use etagere::BucketedAtlasAllocator;
 use parking_lot::Mutex;
 use windows::Win32::Graphics::{
@@ -11,13 +11,13 @@ use windows::Win32::Graphics::{
 };
 
 use gpui::{
-    AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
-    PlatformAtlas, Point, Size,
+    AtlasBackend, AtlasKey, AtlasState, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
+    AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Size,
 };
 
-pub(crate) struct DirectXAtlas(Mutex<DirectXAtlasState>);
+pub(crate) struct DirectXAtlas(Mutex<AtlasState<DirectXAtlasTextures>>);
 
-struct DirectXAtlasState {
+struct DirectXAtlasTextures {
     device: ID3D11Device,
     device_context: ID3D11DeviceContext,
     monochrome_textures: AtlasTextureList<DirectXAtlasTexture>,
@@ -25,7 +25,6 @@ struct DirectXAtlasState {
     subpixel_textures: AtlasTextureList<DirectXAtlasTexture>,
     bc7_icon_textures: AtlasTextureList<DirectXAtlasTexture>,
     bc7_thumbnail_textures: AtlasTextureList<DirectXAtlasTexture>,
-    tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     bc7_residency: Bc7Residency,
 }
 
@@ -33,6 +32,10 @@ struct DirectXAtlasState {
 struct Bc7Residency {
     costs: FxHashMap<AtlasKey, u64>,
     last_used: FxHashMap<AtlasKey, u64>,
+    keys_by_tile: FxHashMap<(AtlasTextureId, u32), AtlasKey>,
+    /// Keys the last finished frame drew. Retained views replay those primitives
+    /// without touching the atlas, so eviction must leave their pixels in place.
+    frame_keys: FxHashSet<AtlasKey>,
     clock: u64,
 }
 
@@ -53,7 +56,7 @@ impl DirectXAtlas {
         let supported = unsafe { device.CheckFormatSupport(DXGI_FORMAT_BC7_UNORM) }
             .is_ok_and(|flags| flags & required == required);
         gpui::record_compressed_gpu_capability(supported);
-        DirectXAtlas(Mutex::new(DirectXAtlasState {
+        DirectXAtlas(Mutex::new(AtlasState::new(DirectXAtlasTextures {
             device: device.clone(),
             device_context: device_context.clone(),
             monochrome_textures: Default::default(),
@@ -61,18 +64,21 @@ impl DirectXAtlas {
             subpixel_textures: Default::default(),
             bc7_icon_textures: Default::default(),
             bc7_thumbnail_textures: Default::default(),
-            tiles_by_key: Default::default(),
             bc7_residency: Default::default(),
-        }))
+        })))
     }
 
+    /// Returns the view backing `id`, or `None` once every tile in it has been
+    /// removed. A scene can still reference such a texture when a cached view
+    /// replays a paint from before the image was dropped, so callers must skip
+    /// those sprites rather than assume the texture exists.
     pub(crate) fn get_texture_view(
         &self,
         id: AtlasTextureId,
-    ) -> [Option<ID3D11ShaderResourceView>; 1] {
+    ) -> Option<[Option<ID3D11ShaderResourceView>; 1]> {
         let lock = self.0.lock();
-        let tex = lock.texture(id);
-        tex.view.clone()
+        let texture = lock.backend.texture(id)?;
+        Some(texture.view.clone())
     }
 
     pub(crate) fn handle_device_lost(
@@ -81,42 +87,29 @@ impl DirectXAtlas {
         device_context: &ID3D11DeviceContext,
     ) {
         let mut lock = self.0.lock();
-        lock.device = device.clone();
-        lock.device_context = device_context.clone();
-        lock.monochrome_textures = AtlasTextureList::default();
-        lock.polychrome_textures = AtlasTextureList::default();
-        lock.subpixel_textures = AtlasTextureList::default();
-        lock.bc7_icon_textures = AtlasTextureList::default();
-        lock.bc7_thumbnail_textures = AtlasTextureList::default();
-        lock.tiles_by_key.clear();
-        lock.bc7_residency = Bc7Residency::default();
-        lock.publish_bc7_stats();
+        lock.clear(|textures| {
+            textures.device = device.clone();
+            textures.device_context = device_context.clone();
+            textures.monochrome_textures = AtlasTextureList::default();
+            textures.polychrome_textures = AtlasTextureList::default();
+            textures.subpixel_textures = AtlasTextureList::default();
+            textures.bc7_icon_textures = AtlasTextureList::default();
+            textures.bc7_thumbnail_textures = AtlasTextureList::default();
+            textures.bc7_residency = Bc7Residency::default();
+            textures.publish_bc7_stats();
+        });
     }
 }
 
 impl PlatformAtlas for DirectXAtlas {
     fn get_or_insert_with<'a>(
         &self,
-        key: &AtlasKey,
+        key: AtlasKey,
         build: &mut dyn FnMut() -> anyhow::Result<
             Option<(Size<DevicePixels>, std::borrow::Cow<'a, [u8]>)>,
         >,
     ) -> anyhow::Result<Option<AtlasTile>> {
-        let mut lock = self.0.lock();
-        if let Some(tile) = lock.tiles_by_key.get(key) {
-            Ok(Some(*tile))
-        } else {
-            let Some((size, bytes)) = build()? else {
-                return Ok(None);
-            };
-            let tile = lock
-                .allocate(size, key.texture_kind())
-                .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
-            let texture = lock.texture(tile.texture_id);
-            texture.upload(&lock.device_context, tile.bounds, &bytes);
-            lock.tiles_by_key.insert(key.clone(), tile);
-            Ok(Some(tile))
-        }
+        self.0.lock().get_or_insert_with(key, build)
     }
 
     fn get_or_insert_bc7(
@@ -140,7 +133,8 @@ impl PlatformAtlas for DirectXAtlas {
             anyhow::bail!("invalid BC7 block layout");
         }
         let mut lock = self.0.lock();
-        let owner = DirectXAtlasState::bc7_kind(key.texture_kind())
+        let kind = key.texture_kind();
+        let owner = DirectXAtlasTextures::bc7_kind(kind)
             .ok_or_else(|| anyhow::anyhow!("invalid BC7 cache kind"))?;
         if blocks.len() as u64 > gpui::compressed_gpu_cache_limit(owner) {
             anyhow::bail!("BC7 raster exceeds its GPU cache budget");
@@ -148,76 +142,143 @@ impl PlatformAtlas for DirectXAtlas {
         // GPUI's icon/thumbnail shader path already preserves encoded display values and its
         // existing polychrome atlas is UNORM. Using an sRGB SRV here would linearize the sample a
         // second time and visibly darken Shell assets.
-        let format_support = unsafe { lock.device.CheckFormatSupport(DXGI_FORMAT_BC7_UNORM)? };
+        let format_support = unsafe {
+            lock.backend
+                .device
+                .CheckFormatSupport(DXGI_FORMAT_BC7_UNORM)?
+        };
         let required =
             D3D11_FORMAT_SUPPORT_TEXTURE2D.0 as u32 | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE.0 as u32;
         if format_support & required != required {
             anyhow::bail!("D3D11 adapter does not support BC7 sampling");
         }
         let limit = gpui::compressed_gpu_cache_limit(owner);
-        while lock.bc7_resident_bytes(key.texture_kind()) > limit {
-            let Some(victim) = lock.least_recent_bc7(key.texture_kind()) else {
+        while lock.backend.bc7_residency.bytes(kind) > limit {
+            let Some(victim) = lock.backend.bc7_residency.least_recent(kind) else {
                 break;
             };
-            lock.remove_key(&victim, true);
+            Self::remove_key(&mut lock, &victim, true);
         }
-        if let Some(tile) = lock.tiles_by_key.get(key).copied() {
-            lock.promote_bc7(key);
+        if let Some(tile) = lock.get(key) {
+            lock.backend.bc7_residency.promote(key);
             return Ok(Some(tile));
         }
         while lock
-            .bc7_resident_bytes(key.texture_kind())
+            .backend
+            .bc7_residency
+            .bytes(kind)
             .saturating_add(blocks.len() as u64)
             > limit
         {
-            let Some(victim) = lock.least_recent_bc7(key.texture_kind()) else {
-                anyhow::bail!("BC7 GPU cache budget is full");
+            // Everything left is on screen: run over budget until the next frame
+            // rather than overwrite pixels a replayed primitive still samples.
+            let Some(victim) = lock.backend.bc7_residency.least_recent(kind) else {
+                break;
             };
-            lock.remove_key(&victim, true);
+            Self::remove_key(&mut lock, &victim, true);
         }
         let tile = lock
-            .allocate_bc7(size, padded_size, key.texture_kind())
+            .backend
+            .allocate_bc7(size, padded_size, kind)
             .ok_or_else(|| anyhow::anyhow!("failed to allocate BC7 atlas tile"))?;
-        let texture = lock.texture(tile.texture_id);
+        let textures = &lock.backend;
+        let texture = textures
+            .texture(tile.texture_id)
+            .ok_or_else(|| anyhow::anyhow!("allocated tile refers to a missing texture"))?;
         texture.upload_bc7(
-            &lock.device_context,
+            &textures.device_context,
             tile.bounds.origin,
             padded_size,
             row_pitch,
             blocks,
         );
         gpui::record_compressed_gpu_upload(owner);
-        lock.tiles_by_key.insert(key.clone(), tile);
-        lock.bc7_residency.insert(key.clone(), blocks.len() as u64);
-        lock.publish_bc7_stats();
+        lock.insert_tile(key.clone(), tile);
+        lock.backend
+            .bc7_residency
+            .insert(key.clone(), blocks.len() as u64);
+        lock.backend
+            .bc7_residency
+            .bind_tile(key.clone(), tile_identity(&tile));
+        lock.backend.publish_bc7_stats();
         Ok(Some(tile))
     }
 
     fn remove(&self, key: &AtlasKey) {
-        let mut lock = self.0.lock();
-        lock.remove_key(key, false);
+        Self::remove_key(&mut self.0.lock(), key, false);
+    }
+
+    fn retain_frame_tiles(&self, tiles: &mut dyn Iterator<Item = AtlasTile>) {
+        self.0
+            .lock()
+            .backend
+            .bc7_residency
+            .retain_frame(tiles.map(|tile| tile_identity(&tile)));
     }
 }
 
-impl DirectXAtlasState {
-    fn promote_bc7(&mut self, key: &AtlasKey) {
-        self.bc7_residency.promote(key);
+impl DirectXAtlas {
+    fn remove_key(state: &mut AtlasState<DirectXAtlasTextures>, key: &AtlasKey, evicted: bool) {
+        state.backend.bc7_residency.remove(key);
+        if evicted && let Some(owner) = DirectXAtlasTextures::bc7_kind(key.texture_kind()) {
+            gpui::record_compressed_gpu_eviction(owner);
+        }
+        state.remove(key);
+        state.backend.publish_bc7_stats();
+    }
+}
+
+impl AtlasBackend for DirectXAtlasTextures {
+    fn insert(
+        &mut self,
+        kind: AtlasTextureKind,
+        size: Size<DevicePixels>,
+        bytes: &[u8],
+    ) -> anyhow::Result<AtlasTile> {
+        let tile = self
+            .allocate(size, kind)
+            .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
+        let texture = self
+            .texture(tile.texture_id)
+            .ok_or_else(|| anyhow::anyhow!("allocated tile refers to a missing texture"))?;
+        texture.upload(&self.device_context, tile.bounds, bytes);
+        Ok(tile)
     }
 
-    fn least_recent_bc7(&self, kind: AtlasTextureKind) -> Option<AtlasKey> {
-        self.bc7_residency.least_recent(kind)
-    }
+    fn remove(&mut self, tile: AtlasTile) {
+        let id = tile.texture_id;
 
+        let textures = match id.kind {
+            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
+            AtlasTextureKind::Bc7Icon => &mut self.bc7_icon_textures,
+            AtlasTextureKind::Bc7Thumbnail => &mut self.bc7_thumbnail_textures,
+        };
+
+        let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
+            return;
+        };
+
+        if let Some(mut texture) = texture_slot.take() {
+            texture.allocator.deallocate(tile.tile_id.into());
+            texture.decrement_ref_count();
+            if texture.is_unreferenced() {
+                textures.free_list.push(texture.id.index as usize);
+            } else {
+                *texture_slot = Some(texture);
+            }
+        }
+    }
+}
+
+impl DirectXAtlasTextures {
     fn bc7_kind(kind: AtlasTextureKind) -> Option<gpui::CompressedRasterKind> {
         match kind {
             AtlasTextureKind::Bc7Icon => Some(gpui::CompressedRasterKind::Icon),
             AtlasTextureKind::Bc7Thumbnail => Some(gpui::CompressedRasterKind::Thumbnail),
             _ => None,
         }
-    }
-
-    fn bc7_resident_bytes(&self, kind: AtlasTextureKind) -> u64 {
-        self.bc7_residency.bytes(kind)
     }
 
     fn publish_bc7_stats(&self) {
@@ -232,39 +293,6 @@ impl DirectXAtlasState {
             let entries = self.bc7_residency.entries(kind);
             gpui::record_compressed_gpu_cache(owner, bytes, entries);
         }
-    }
-
-    fn remove_key(&mut self, key: &AtlasKey, evicted: bool) {
-        let owner = Self::bc7_kind(key.texture_kind());
-        self.bc7_residency.remove(key);
-        if evicted && let Some(owner) = owner {
-            gpui::record_compressed_gpu_eviction(owner);
-        }
-        let Some(tile) = self.tiles_by_key.remove(key) else {
-            self.publish_bc7_stats();
-            return;
-        };
-        let id = tile.texture_id;
-        let textures = match id.kind {
-            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
-            AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
-            AtlasTextureKind::Bc7Icon => &mut self.bc7_icon_textures,
-            AtlasTextureKind::Bc7Thumbnail => &mut self.bc7_thumbnail_textures,
-        };
-        let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
-            self.publish_bc7_stats();
-            return;
-        };
-        if let Some(mut texture) = texture_slot.take() {
-            texture.decrement_ref_count();
-            if texture.is_unreferenced() {
-                textures.free_list.push(texture.id.index as usize);
-            } else {
-                *texture_slot = Some(texture);
-            }
-        }
-        self.publish_bc7_stats();
     }
 
     fn allocate(
@@ -432,24 +460,15 @@ impl DirectXAtlasState {
         }
     }
 
-    fn texture(&self, id: AtlasTextureId) -> &DirectXAtlasTexture {
-        match id.kind {
-            AtlasTextureKind::Monochrome => &self.monochrome_textures[id.index as usize]
-                .as_ref()
-                .unwrap(),
-            AtlasTextureKind::Polychrome => &self.polychrome_textures[id.index as usize]
-                .as_ref()
-                .unwrap(),
-            AtlasTextureKind::Subpixel => {
-                &self.subpixel_textures[id.index as usize].as_ref().unwrap()
-            }
-            AtlasTextureKind::Bc7Icon => {
-                &self.bc7_icon_textures[id.index as usize].as_ref().unwrap()
-            }
-            AtlasTextureKind::Bc7Thumbnail => &self.bc7_thumbnail_textures[id.index as usize]
-                .as_ref()
-                .unwrap(),
-        }
+    fn texture(&self, id: AtlasTextureId) -> Option<&DirectXAtlasTexture> {
+        let textures = match id.kind {
+            AtlasTextureKind::Monochrome => &self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &self.polychrome_textures,
+            AtlasTextureKind::Subpixel => &self.subpixel_textures,
+            AtlasTextureKind::Bc7Icon => &self.bc7_icon_textures,
+            AtlasTextureKind::Bc7Thumbnail => &self.bc7_thumbnail_textures,
+        };
+        textures.textures.get(id.index as usize)?.as_ref()
     }
 }
 
@@ -483,6 +502,24 @@ impl DirectXAtlasTexture {
         bytes: &[u8],
     ) {
         debug_assert!(!self.bc7);
+        // `UpdateSubresource` reads `row_pitch * height` bytes from `bytes` based on the
+        // `D3D11_BOX` below. If the caller hands us a slice shorter than that, the driver would
+        // over-read past the end of the source buffer (potentially by multiple megabytes), so bail
+        // out instead. This is a first-insert path rather than a per-frame one, so the check is
+        // effectively free.
+        let row_bytes = bounds.size.width.to_bytes(self.bytes_per_pixel as u8) as usize;
+        let expected = row_bytes * bounds.size.height.0.max(0) as usize;
+        if bytes.len() < expected {
+            log::error!(
+                "DirectXAtlasTexture::upload: source slice is {} bytes but the {}x{} region \
+                 requires {} bytes; skipping upload to avoid a driver over-read",
+                bytes.len(),
+                bounds.size.width.0,
+                bounds.size.height.0,
+                expected,
+            );
+            return;
+        }
         unsafe {
             device_context.UpdateSubresource(
                 &self.texture,
@@ -561,10 +598,26 @@ impl Bc7Residency {
         self.last_used.insert(key.clone(), self.clock);
     }
 
+    fn bind_tile(&mut self, key: AtlasKey, tile: (AtlasTextureId, u32)) {
+        self.keys_by_tile.insert(tile, key);
+    }
+
+    fn retain_frame(&mut self, tiles: impl Iterator<Item = (AtlasTextureId, u32)>) {
+        self.frame_keys.clear();
+        if self.keys_by_tile.is_empty() {
+            return;
+        }
+        for tile in tiles {
+            if let Some(key) = self.keys_by_tile.get(&tile) {
+                self.frame_keys.insert(key.clone());
+            }
+        }
+    }
+
     fn least_recent(&self, kind: AtlasTextureKind) -> Option<AtlasKey> {
         self.last_used
             .iter()
-            .filter(|(key, _)| key.texture_kind() == kind)
+            .filter(|(key, _)| key.texture_kind() == kind && !self.frame_keys.contains(*key))
             .min_by_key(|(_, last_used)| **last_used)
             .map(|(key, _)| key.clone())
     }
@@ -586,16 +639,68 @@ impl Bc7Residency {
 
     fn remove(&mut self, key: &AtlasKey) -> Option<u64> {
         self.last_used.remove(key);
+        self.frame_keys.remove(key);
+        self.keys_by_tile.retain(|_, bound| bound != key);
         self.costs.remove(key)
     }
+}
+
+fn tile_identity(tile: &AtlasTile) -> (AtlasTextureId, u32) {
+    (tile.texture_id, tile.tile_id.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{CompressedRasterKind, ImageId, RenderImageParams};
+    use std::borrow::Cow;
+    use windows::Win32::{
+        Foundation::HMODULE,
+        Graphics::{
+            Direct3D::D3D_DRIVER_TYPE_WARP,
+            Direct3D11::{D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice},
+        },
+    };
 
-    fn key(id: usize, kind: CompressedRasterKind) -> AtlasKey {
+    fn create_atlas() -> Option<DirectXAtlas> {
+        let mut device: Option<ID3D11Device> = None;
+        let mut device_context: Option<ID3D11DeviceContext> = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut device_context),
+            )
+        }
+        .ok()?;
+        Some(DirectXAtlas::new(&device?, &device_context?))
+    }
+
+    fn make_image_key(image_id: usize) -> AtlasKey {
+        AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(image_id),
+            frame_index: 0,
+            compressed_bc7_srgb: None,
+        })
+    }
+
+    fn insert_tile(atlas: &DirectXAtlas, key: AtlasKey, size: Size<DevicePixels>) -> AtlasTile {
+        atlas
+            .get_or_insert_with(key, &mut || {
+                let byte_count = (size.width.0 as usize) * (size.height.0 as usize) * 4;
+                Ok(Some((size, Cow::Owned(vec![0u8; byte_count]))))
+            })
+            .expect("allocation should succeed")
+            .expect("callback returns Some")
+    }
+
+    fn bc7_key(id: usize, kind: CompressedRasterKind) -> AtlasKey {
         AtlasKey::Image(RenderImageParams {
             image_id: ImageId(id),
             frame_index: 0,
@@ -604,10 +709,46 @@ mod tests {
     }
 
     #[test]
+    fn eviction_skips_tiles_the_last_frame_drew() {
+        let texture = AtlasTextureId {
+            index: 0,
+            kind: AtlasTextureKind::Bc7Thumbnail,
+        };
+        let replayed = bc7_key(1, CompressedRasterKind::Thumbnail);
+        let offscreen = bc7_key(2, CompressedRasterKind::Thumbnail);
+        let mut residency = Bc7Residency::default();
+        residency.insert(replayed.clone(), 16);
+        residency.bind_tile(replayed.clone(), (texture, 1));
+        residency.insert(offscreen.clone(), 16);
+        residency.bind_tile(offscreen.clone(), (texture, 2));
+
+        residency.retain_frame([(texture, 1)].into_iter());
+        assert!(
+            residency
+                .least_recent(AtlasTextureKind::Bc7Thumbnail)
+                .is_some_and(|key| key == offscreen)
+        );
+
+        residency.retain_frame([(texture, 1), (texture, 2)].into_iter());
+        assert!(
+            residency
+                .least_recent(AtlasTextureKind::Bc7Thumbnail)
+                .is_none()
+        );
+
+        residency.retain_frame(std::iter::empty());
+        assert!(
+            residency
+                .least_recent(AtlasTextureKind::Bc7Thumbnail)
+                .is_some_and(|key| key == replayed)
+        );
+    }
+
+    #[test]
     fn lru_selection_promotes_hits_and_never_crosses_ownership_kinds() {
-        let icon_old = key(1, CompressedRasterKind::Icon);
-        let icon_new = key(2, CompressedRasterKind::Icon);
-        let thumbnail = key(3, CompressedRasterKind::Thumbnail);
+        let icon_old = bc7_key(1, CompressedRasterKind::Icon);
+        let icon_new = bc7_key(2, CompressedRasterKind::Icon);
+        let thumbnail = bc7_key(3, CompressedRasterKind::Thumbnail);
         let mut residency = Bc7Residency::default();
         residency.insert(icon_old.clone(), 16);
         residency.insert(thumbnail.clone(), 64);
@@ -633,5 +774,34 @@ mod tests {
         assert_eq!(residency.remove(&icon_new), Some(32));
         assert_eq!(residency.bytes(AtlasTextureKind::Bc7Icon), 16);
         assert_eq!(residency.entries(AtlasTextureKind::Bc7Icon), 1);
+    }
+
+    #[test]
+    fn test_remove_deallocates_tile_space_for_reuse() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+
+        let small = Size {
+            width: DevicePixels(64),
+            height: DevicePixels(64),
+        };
+        let big = Size {
+            width: DevicePixels(700),
+            height: DevicePixels(700),
+        };
+
+        let keeper_key = make_image_key(1);
+        let big_key_a = make_image_key(2);
+        let big_key_b = make_image_key(3);
+
+        let keeper_tile = insert_tile(&atlas, keeper_key, small);
+        let tile_a = insert_tile(&atlas, big_key_a.clone(), big);
+        assert_eq!(keeper_tile.texture_id, tile_a.texture_id);
+
+        atlas.remove(&big_key_a);
+
+        let tile_b = insert_tile(&atlas, big_key_b, big);
+        assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
     }
 }

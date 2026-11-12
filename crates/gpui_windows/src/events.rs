@@ -1,8 +1,7 @@
-#[cfg(feature = "wgpu")]
-use crate::window::RawWindow;
-use ::util::ResultExt;
+use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
+
 use anyhow::Context as _;
-use std::{rc::Rc, sync::atomic::Ordering};
+use gpui_util::ResultExt;
 use windows::{
     Win32::{
         Foundation::*,
@@ -28,9 +27,57 @@ pub(crate) const WM_GPUI_DOCK_MENU_ACTION: u32 = WM_USER + 4;
 pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = WM_USER + 5;
 pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
 pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
-pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
+pub(crate) const WM_GPUI_DISPLAYS_CHANGED: u32 = WM_USER + 10;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+
+/// Coordinates window draws on the UI thread. Owned by the platform and
+/// shared with every window (like `WindowsPlatformState::cursor_visible`),
+/// because the coordination is inherently cross-window: while window A is
+/// drawing, a re-entrant paint request for window B must be deferred.
+pub(crate) struct DrawCoordinator {
+    pub(crate) fast_frame_wake: std::sync::Arc<crate::fast::frame_schedule::FrameWake>,
+    /// Whether some window is currently inside `draw_window`. Win32 can
+    /// re-enter the window procedure while a draw is in progress (e.g.
+    /// cross-thread `SendMessage` dispatch during message pumping, or modal
+    /// message loops entered by COM calls), and drawing re-entrantly would
+    /// nest GPUI draws. Nested draws are wasted work whose output is
+    /// immediately redrawn, so we defer them instead.
+    drawing: Cell<bool>,
+}
+
+impl DrawCoordinator {
+    pub(crate) fn new() -> Self {
+        Self {
+            fast_frame_wake: Default::default(),
+            drawing: Cell::new(false),
+        }
+    }
+
+    fn try_begin_draw(&self) -> Option<DrawWindowGuard<'_>> {
+        // This only covers the `draw_window` span (which extends past the GPUI
+        // draw, through presentation and IME updates). Requests that arrive
+        // re-entrantly during GPUI-initiated draws (e.g. key dispatch or
+        // opening a window draws synchronously) are deferred by GPUI's
+        // `on_request_frame` callback itself, which no-ops in that case.
+        if self.drawing.get() {
+            None
+        } else {
+            self.drawing.set(true);
+            Some(DrawWindowGuard { coordinator: self })
+        }
+    }
+}
+
+struct DrawWindowGuard<'a> {
+    coordinator: &'a DrawCoordinator,
+}
+
+impl Drop for DrawWindowGuard<'_> {
+    fn drop(&mut self) {
+        self.coordinator.drawing.set(false);
+    }
+}
 
 impl WindowsWindowInner {
     pub(crate) fn handle_msg(
@@ -41,11 +88,13 @@ impl WindowsWindowInner {
         lparam: LPARAM,
     ) -> LRESULT {
         let handled = match msg {
-            // eagerly activate the window, so calls to `active_window` will work correctly
-            WM_MOUSEACTIVATE => {
-                unsafe { SetActiveWindow(handle).ok() };
-                None
-            }
+            // `DefWindowProc` answers `MA_NOACTIVATE` for a left click on `HTCAPTION`.
+            // The activation is only triggered when `DefWindowProc` handles the following `WM_NCLBUTTONDOWN`.
+            // The GPUI event is dispatched in between, so a click handler runs while `active_window` is still
+            // whichever window was active before the click. If that handler consumes the
+            // press, `DefWindowProc` never sees it, so the window is never activated at all.
+            // So, let's eagerly activate the window.
+            WM_MOUSEACTIVATE => Some(MA_ACTIVATE as isize),
             WM_ACTIVATE => self.handle_activate_msg(wparam),
             WM_CREATE => self.handle_create_msg(handle),
             WM_MOVE => self.handle_move_msg(handle, lparam),
@@ -101,7 +150,6 @@ impl WindowsWindowInner {
             WM_MOUSEHWHEEL => self.handle_mouse_horizontal_wheel_msg(handle, wparam, lparam),
             WM_SYSKEYUP => self.handle_syskeyup_msg(wparam, lparam),
             WM_KEYUP => self.handle_keyup_msg(wparam, lparam),
-            WM_GPUI_KEYDOWN => self.handle_keydown_msg(wparam, lparam),
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
@@ -109,11 +157,11 @@ impl WindowsWindowInner {
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
             WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
-            WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
-            WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
-            WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
+            WM_GPUI_CURSOR_STYLE_CHANGED
+            | WM_GPUI_FORCE_UPDATE_WINDOW
+            | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(handle, msg, wparam, lparam),
             _ => None,
         };
         if let Some(n) = handled {
@@ -145,7 +193,7 @@ impl WindowsWindowInner {
             // monitor is invalid, we do nothing.
             if !monitor.is_invalid() && self.state.display.get().handle != monitor {
                 // we will get the same monitor if we only have one
-                self.state.display.set(WindowsDisplay::new(
+                self.set_display(WindowsDisplay::new(
                     WindowsDisplay::display_id_for_monitor(monitor),
                 )?);
             }
@@ -172,7 +220,11 @@ impl WindowsWindowInner {
         Some(0)
     }
 
-    fn handle_size_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+    fn handle_size_msg(self: &Rc<Self>, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        // Minimizing and restoring both arrive as `WM_SIZE`; the deferred report
+        // reads `IsIconic` at delivery, so one call covers both directions.
+        self.report_visibility();
+
         // Don't resize the renderer when the window is minimized, but record that it was minimized so
         // that on restore the swap chain can be recreated via `update_drawable_size_even_if_unchanged`.
         if wparam.0 == SIZE_MINIMIZED as usize {
@@ -210,25 +262,8 @@ impl WindowsWindowInner {
         let new_logical_size = device_size.to_pixels(scale_factor);
 
         self.state.logical_size.set(new_logical_size);
-        #[cfg(not(feature = "wgpu"))]
-        {
-            if should_resize_renderer
-                && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
-            {
-                log::error!("Failed to resize renderer, invalidating devices: {}", e);
-                self.state
-                    .invalidate_devices
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
-        }
-        #[cfg(feature = "wgpu")]
-        {
-            if should_resize_renderer {
-                self.state
-                    .renderer
-                    .borrow_mut()
-                    .update_drawable_size(device_size)
-            }
+        if should_resize_renderer {
+            crate::fast::device_recovery::resize(self, device_size);
         }
         if let Some(mut callback) = self.state.callbacks.resize.take() {
             callback(new_logical_size, scale_factor);
@@ -255,13 +290,6 @@ impl WindowsWindowInner {
     }
 
     fn handle_size_move_loop_exit(&self, handle: HWND) -> Option<isize> {
-        // emulating winit to support dragging a window
-        // https://github.com/rust-windowing/winit/blob/9674d8ceef6976326fe9583a81f2e684daac05d6/winit-win32/src/event_loop.rs#L1234-L1243
-        if self.state.dragging.get() {
-            self.state.dragging.set(false);
-            let _ = unsafe { PostMessageW(Some(handle), WM_LBUTTONUP, WPARAM(0), LPARAM(0)) };
-        }
-
         unsafe {
             KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID).log_err();
         }
@@ -320,10 +348,10 @@ impl WindowsWindowInner {
         self.start_tracking_mouse(handle, TME_LEAVE);
         self.restore_cursor_after_hide();
 
-        let Some(mut func) = self.state.callbacks.input.take() else {
-            return Some(1);
-        };
+        let x = lparam.signed_loword() as f32;
+        let y = lparam.signed_hiword() as f32;
         let scale_factor = self.state.scale_factor.get();
+        let new_position = logical_point(x, y, scale_factor);
 
         let pressed_button = match MODIFIERKEYS_FLAGS(wparam.loword() as u32) {
             flags if flags.contains(MK_LBUTTON) => Some(MouseButton::Left),
@@ -337,16 +365,27 @@ impl WindowsWindowInner {
             }
             _ => None,
         };
-        let x = lparam.signed_loword() as f32;
-        let y = lparam.signed_hiword() as f32;
+
+        // Suppress synthetic WM_MOUSEMOVE events that Windows fires when a window
+        // repaints under the cursor (e.g. command palette opening). These are not
+        // real mouse movements and should not move the editor cursor or clobber
+        // selections. A real move always has a different position OR a button held.
+        if pressed_button.is_none() && new_position == self.state.mouse_position.get() {
+            return Some(1);
+        }
+        self.state.mouse_position.set(new_position);
+
+        let Some(mut func) = self.state.callbacks.input.take() else {
+            return Some(1);
+        };
+
         let input = PlatformInput::MouseMove(MouseMoveEvent {
-            position: logical_point(x, y, scale_factor),
+            position: new_position,
             pressed_button,
             modifiers: current_modifiers(),
         });
         let handled = !func(input).propagate;
         self.state.callbacks.input.set(Some(func));
-
         if handled { Some(0) } else { Some(1) }
     }
 
@@ -381,7 +420,7 @@ impl WindowsWindowInner {
 
     // It's a known bug that you can't trigger `ctrl-shift-0`. See:
     // https://superuser.com/questions/1455762/ctrl-shift-number-key-combination-has-stopped-working-for-a-few-numbers
-    fn handle_keydown_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+    pub(crate) fn handle_keydown_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
         let Some(input) = handle_key_event(
             wparam,
             lparam,
@@ -539,7 +578,7 @@ impl WindowsWindowInner {
             y: lparam.signed_hiword().into(),
         };
         unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
-        let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
+        let input = PlatformInput::Scroll(ScrollEvent {
             position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
             delta: ScrollDelta::Lines(match modifiers.shift {
                 true => Point {
@@ -553,6 +592,7 @@ impl WindowsWindowInner {
             }),
             modifiers,
             touch_phase: TouchPhase::Moved,
+            source: ScrollSource::Pointer,
         });
         let handled = !func(input).propagate;
         self.state.callbacks.input.set(Some(func));
@@ -583,7 +623,7 @@ impl WindowsWindowInner {
             y: lparam.signed_hiword().into(),
         };
         unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
-        let event = PlatformInput::ScrollWheel(ScrollWheelEvent {
+        let event = PlatformInput::Scroll(ScrollEvent {
             position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
             delta: ScrollDelta::Lines(Point {
                 x: wheel_distance,
@@ -591,6 +631,7 @@ impl WindowsWindowInner {
             }),
             modifiers: current_modifiers(),
             touch_phase: TouchPhase::Moved,
+            source: ScrollSource::Pointer,
         });
         let handled = !func(event).propagate;
         self.state.callbacks.input.set(Some(func));
@@ -661,7 +702,11 @@ impl WindowsWindowInner {
                     .ok()
                     .log_err();
             } else {
-                if let Some(ctx) = ImeContext::get(handle) {
+                // The IME context is per-thread, so without this check a change in this
+                // window's text input state could commit an IME composition happening in another window.
+                if GetFocus() == handle
+                    && let Some(ctx) = ImeContext::get(handle)
+                {
                     ImmNotifyIME(*ctx, NI_COMPOSITIONSTR, CPS_COMPLETE, 0)
                         .ok()
                         .log_err();
@@ -833,6 +878,7 @@ impl WindowsWindowInner {
         let is_maximized = self.state.is_maximized();
         let new_scale_factor = new_dpi / USER_DEFAULT_SCREEN_DPI as f32;
         self.state.scale_factor.set(new_scale_factor);
+        crate::fast::layers::release_tiles(&mut self.state.renderer.borrow_mut());
         self.state.border_offset.update(handle).log_err();
 
         self.state
@@ -903,12 +949,20 @@ impl WindowsWindowInner {
             return None;
         }
         let new_display = WindowsDisplay::new(WindowsDisplay::display_id_for_monitor(new_monitor))?;
-        self.state.display.set(new_display);
+        self.set_display(new_display);
         Some(0)
     }
 
+    fn set_display(&self, display: WindowsDisplay) {
+        self.state.display.set(display);
+        if let Some(mut callback) = self.state.callbacks.display_changed.take() {
+            callback();
+            self.state.callbacks.display_changed.set(Some(callback));
+        }
+    }
+
     fn handle_hit_test_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
-        if !self.is_movable || self.state.is_fullscreen() {
+        if self.state.is_fullscreen() {
             return None;
         }
 
@@ -919,16 +973,17 @@ impl WindowsWindowInner {
                 .callbacks
                 .hit_test_window_control
                 .set(Some(callback));
-            if let Some(area) = area {
-                match area {
-                    WindowControlArea::Drag => Some(HTCAPTION as _),
-                    WindowControlArea::Close => return Some(HTCLOSE as _),
-                    WindowControlArea::Max => return Some(HTMAXBUTTON as _),
-                    WindowControlArea::Min => return Some(HTMINBUTTON as _),
-                }
-            } else {
-                None
-            }
+            area.and_then(|area| match area {
+                WindowControlArea::Drag if self.is_movable => Some(HTCAPTION as _),
+                WindowControlArea::Drag => None,
+                WindowControlArea::Close => Some(HTCLOSE as _),
+                WindowControlArea::Max if self.is_resizable => Some(HTMAXBUTTON as _),
+                WindowControlArea::Max if self.is_movable => Some(HTCAPTION as _),
+                WindowControlArea::Max => Some(HTNOWHERE as _),
+                WindowControlArea::Min if self.is_minimizable => Some(HTMINBUTTON as _),
+                WindowControlArea::Min if self.is_movable => Some(HTCAPTION as _),
+                WindowControlArea::Min => Some(HTNOWHERE as _),
+            })
         } else {
             None
         };
@@ -938,7 +993,7 @@ impl WindowsWindowInner {
             return drag_area;
         }
 
-        if !self.state.is_maximized() {
+        if self.is_resizable && !self.state.is_maximized() {
             let dpi = unsafe { GetDpiForWindow(handle) };
             // Without an OS title bar, DefWindowProcW only keeps a 1px resize edge.
             // Hit-test all four edges and four corners with the real frame thickness
@@ -1080,11 +1135,12 @@ impl WindowsWindowInner {
             && let Some(last_pressed) = last_pressed
         {
             let handled = match (wparam.0 as u32, last_pressed) {
-                (HTMINBUTTON, HTMINBUTTON) => {
+                (HTMINBUTTON, HTMINBUTTON) if self.is_minimizable => {
                     unsafe { ShowWindowAsync(handle, SW_MINIMIZE).ok().log_err() };
                     true
                 }
-                (HTMAXBUTTON, HTMAXBUTTON) => {
+                (HTMINBUTTON, HTMINBUTTON) => true,
+                (HTMAXBUTTON, HTMAXBUTTON) if self.is_resizable => {
                     if self.state.is_maximized() {
                         unsafe { ShowWindowAsync(handle, SW_NORMAL).ok().log_err() };
                     } else {
@@ -1092,6 +1148,7 @@ impl WindowsWindowInner {
                     }
                     true
                 }
+                (HTMAXBUTTON, HTMAXBUTTON) => true,
                 (HTCLOSE, HTCLOSE) => {
                     unsafe {
                         PostMessageW(Some(handle), WM_CLOSE, WPARAM::default(), LPARAM::default())
@@ -1210,41 +1267,76 @@ impl WindowsWindowInner {
         Some(0)
     }
 
-    fn handle_window_visibility_changed(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {
+    fn handle_window_visibility_changed(
+        self: &Rc<Self>,
+        handle: HWND,
+        wparam: WPARAM,
+    ) -> Option<isize> {
+        self.report_visibility();
         if wparam.0 == 1 {
             self.draw_window(handle, false);
         }
         None
     }
 
-    fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
-        #[cfg(not(feature = "wgpu"))]
-        {
-            let devices = lparam.0 as *const DirectXDevices;
-            let devices = unsafe { &*devices };
-            if let Err(err) = self
-                .state
-                .renderer
-                .borrow_mut()
-                .handle_device_lost(&devices)
-            {
-                record_isolated_failure("gpui", "device_lost", &format!("Device lost: {err}"));
-            }
+    // The window procedure can run while GPUI is updating this window (e.g.
+    // `ShowWindow` from an action handler), so deliver observers after that
+    // update completes, as activation does. The state is read at delivery so
+    // a burst of messages collapses to the final value.
+    fn report_visibility(self: &Rc<Self>) {
+        if self.state.last_visibility.get().is_none() {
+            return;
         }
-        #[cfg(feature = "wgpu")]
-        {
-            _ = lparam;
-            if let Err(err) = self.state.renderer.borrow_mut().recover(&RawWindow {
-                hwnd: self.platform_window_handle,
-            }) {
-                record_isolated_failure("gpui", "device_lost", &format!("Device lost: {err}"));
-            }
+        let this = self.clone();
+        self.executor
+            .spawn(async move {
+                let visibility = this.visibility();
+                if this.state.last_visibility.get() == Some(visibility) {
+                    return;
+                }
+                this.state.last_visibility.set(Some(visibility));
+                if let Some(mut callback) = this.state.callbacks.visibility_change.take() {
+                    callback(visibility);
+                    this.state.callbacks.visibility_change.set(Some(callback));
+                }
+            })
+            .detach();
+    }
+
+    fn handle_gpui_events(
+        &self,
+        handle: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<isize> {
+        if wparam.0 != self.validation_number {
+            return None;
+        }
+        match message {
+            WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
+            WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
+            WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+            _ => unreachable!(),
+        }
+    }
+
+    fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
+        if lparam.0 == 0 {
+            return None;
+        }
+        let devices = lparam.0 as *const DirectXDevices;
+        let devices = unsafe { &*devices };
+        if !crate::fast::device_recovery::recover(self, devices) {
+            return Some(0);
         }
         // Make sure the first `draw_window` after recovery (whether it comes
         // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in
         // between) is treated as a forced render so it both clears
         // `skip_draws` and bypasses the view cache.
-        self.state.force_render_after_recovery.set(true);
+        self.state.force_render_pending.set(true);
+        #[cfg(test)]
+        crate::fast::native_tests::recovered();
         Some(0)
     }
 
@@ -1255,7 +1347,20 @@ impl WindowsWindowInner {
 
     #[inline]
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
+        let Some(_guard) = self.state.draw_coordinator.try_begin_draw() else {
+            log::debug!("deferring re-entrant draw of window {handle:?}");
+            if force_render {
+                self.state.force_render_pending.set(true);
+            }
+            crate::fast::frame_schedule::defer_draw(self, handle);
+            return Some(0);
+        };
         let mut request_frame = self.state.callbacks.request_frame.take()?;
+        crate::fast::frame_schedule::validate_current_paint(handle);
+        crate::fast::device_recovery::retry_resize(self);
+        #[cfg(test)]
+        crate::fast::native_tests::paint_started(handle);
+
         self.state.direct_manipulation.update();
 
         let events = self.state.direct_manipulation.drain_events();
@@ -1267,23 +1372,28 @@ impl WindowsWindowInner {
                 self.state.callbacks.input.set(Some(func));
             }
         }
-        let force_render = force_render || self.state.force_render_after_recovery.take();
-        #[cfg(not(feature = "wgpu"))]
-        {
-            if force_render {
-                // Re-enable drawing after a device loss recovery. The forced render
-                // will rebuild the scene with fresh atlas textures.
-                self.state.renderer.borrow_mut().mark_drawable();
-            }
+
+        let force_render = force_render || self.state.force_render_pending.take();
+        if force_render {
+            // Re-enable drawing after a device loss recovery. The forced render
+            // will rebuild the scene with fresh atlas textures.
+            self.state.renderer.borrow_mut().mark_drawable();
         }
+        let (signal_at, signal_source) = self.state.frame_signal.take().map_or(
+            (None, FrameRequestSource::NativeCallback),
+            |(at, source)| (Some(at), source),
+        );
         request_frame(RequestFrameOptions {
             require_presentation: false,
             force_render,
+            signal_at,
+            signal_source,
         });
 
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);
-        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+        #[cfg(test)]
+        crate::fast::native_tests::paint_done(handle);
 
         Some(0)
     }

@@ -131,6 +131,7 @@ impl Element for Anchored {
         if request_layout.child_layout_ids.is_empty() {
             return;
         }
+        crate::fast::layers::invalidate::note_anchored(window);
 
         let children_bounds = request_layout
             .child_layout_ids
@@ -355,12 +356,12 @@ mod tests {
 
         window
             .update(cx, |_, window, cx| {
-                let event = gpui::ScrollWheelEvent {
+                let event = gpui::ScrollEvent {
                     position: point(px(400.), px(300.)),
                     delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-1000.))),
                     ..Default::default()
                 };
-                window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+                window.dispatch_event(PlatformInput::Scroll(event), cx);
             })
             .unwrap();
 

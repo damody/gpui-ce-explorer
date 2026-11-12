@@ -1,4 +1,4 @@
-use crate::{Action, DummyKeyboardMapper, KeyBinding, KeyBindingContextPredicate, SharedString};
+use crate::{Action, KeyBinding, KeyBindingContextPredicate, SharedString};
 use std::{any::TypeId, collections::HashMap};
 
 /// A generic collection of `Action` -> keystrokes which can be bound under a shared key-context.
@@ -49,13 +49,10 @@ impl ActionBindingCollection {
             let action = &entry.action;
             let context_predicate = context_predicate.clone();
             entry.keystrokes.iter().map(move |keystrokes| {
-                let keybinding = KeyBinding::load(
+                let keybinding = KeyBinding::load_for_host_os(
                     keystrokes.as_str(),
                     action.boxed_clone(),
                     context_predicate.clone(),
-                    false,
-                    None,
-                    &DummyKeyboardMapper,
                 );
                 keybinding.expect("failed to load keybinding")
             })

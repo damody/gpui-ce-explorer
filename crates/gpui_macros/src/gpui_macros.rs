@@ -1,3 +1,4 @@
+mod bench;
 mod derive_action;
 mod derive_app_context;
 mod derive_into_element;
@@ -28,8 +29,8 @@ pub fn register_action(ident: TokenStream) -> TokenStream {
     register_action::register_action(ident)
 }
 
-/// #[derive(IntoElement)] is used to create a Component out of anything that implements
-/// the `RenderOnce` trait.
+/// #[derive(IntoElement)] generates an `IntoElement` impl for any `RenderOnce`
+/// type, wrapping it in a `ViewElement` so it can be used as a child.
 #[proc_macro_derive(IntoElement)]
 pub fn derive_into_element(input: TokenStream) -> TokenStream {
     derive_into_element::derive_into_element(input)
@@ -189,11 +190,44 @@ pub fn test(args: TokenStream, function: TokenStream) -> TokenStream {
     test::test(args, function)
 }
 
+/// `#[gpui::bench]` annotates a Criterion benchmark that runs with GPUI support.
+///
+/// Use `#[gpui::bench(inputs = some_iterable())]` on benchmarks that take an
+/// additional input argument; the generated benchmark uses Criterion's
+/// `bench_with_input`. `group`, `input_name`, and `sample_size` can customize
+/// the generated input benchmark group.
+///
+/// A benchmark that takes a `StdRng` parameter (by value, in any position) is run
+/// once per seed, with the RNG seeded from it. Seeds are chosen exactly as for
+/// `#[gpui::test]`: `seed = N`, `seeds(...)`, and `iterations = N` take the same
+/// meaning, and the `SEED` and `ITERATIONS` environment variables override them the
+/// same way, so one `SEED` reproduces a test or a benchmark. Each seed is its own
+/// Criterion benchmark, named `<input>/seed-<seed>` (or `<function>/seed-<seed>`
+/// without inputs), and the RNG is rebuilt for every Criterion routine call so all
+/// samples measure the same seed. The generated code seeds it through gpui's own
+/// `rand`, so the crate needs `rand` only to name `StdRng` in the signature.
+///
+/// ```ignore
+/// #[gpui::bench(inputs = families(), iterations = 6)]
+/// fn full_refresh(family: &Family, mut rng: StdRng, cx: &mut BenchAppContext) {
+///     let tree = family.sample(&mut rng);
+///     // ...
+/// }
+/// ```
+///
+/// The benchmark crate must add `criterion` and `gpui_platform` (with its
+/// `test-support` feature) to its dev-dependencies and enable gpui's `bench`
+/// feature, since the generated code references all three.
+#[proc_macro_attribute]
+pub fn bench(args: TokenStream, function: TokenStream) -> TokenStream {
+    bench::bench(args, function)
+}
+
 /// A variant of `#[gpui::test]` that supports property-based testing.
 ///
 /// A property test, much like a standard GPUI randomized test, allows testing
 /// claims of the form "for any possible X, Y should hold". For example:
-/// ```ignore
+/// ```
 /// #[gpui::property_test]
 /// fn test_arithmetic(x: i32, y: i32) {
 ///     assert!(x == y || x < y || x > y);
@@ -236,7 +270,7 @@ pub fn test(args: TokenStream, function: TokenStream) -> TokenStream {
 /// `Arbitrary`. Parameters to a `#[gpui::property_test]`, by default, use a
 /// type's `Arbitrary` implementation. If you'd like to provide a custom
 /// strategy, you can use `#[strategy = ...]` on the argument:
-/// ```ignore
+/// ```
 /// #[gpui::property_test]
 /// fn int_test(#[strategy = 1..10] x: i32, #[strategy = "[a-zA-Z0-9]{20}"] s: String) {
 ///   assert!(s.len() > (x as usize));

@@ -9,6 +9,11 @@ cbuffer GlobalParams: register(b0) {
     uint3 global_pad;
 };
 
+cbuffer BatchParams: register(b1) {
+    uint batch_start_index;
+    uint3 batch_pad;
+};
+
 Texture2D<float4> t_sprite: register(t0);
 SamplerState s_sprite: register(s0);
 
@@ -122,12 +127,12 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds bounds, Bo
 
 // Convert linear RGB to sRGB
 float3 linear_to_srgb(float3 color) {
-    return pow(color, float3(2.2, 2.2, 2.2));
+    return pow(color, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
 }
 
 // Convert sRGB to linear RGB
 float3 srgb_to_linear(float3 color) {
-    return pow(color, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
+    return pow(color, float3(2.2, 2.2, 2.2));
 }
 
 /// Hsla to linear RGBA conversion.
@@ -392,7 +397,7 @@ float4 gradient_color(Background background,
             // ±2/255 for RGB (enough for dark-on-dark compositing),
             // ±3/255 for alpha (needs more because alpha × dark color = tiny steps).
             {
-                float2 seed = position * 0.6180339887; // golden ratio spread
+                float2 seed = (position - bounds.origin) * 0.6180339887; // golden ratio spread
                 float r1 = frac(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
                 float r2 = frac(sin(dot(seed, float2(39.3460, 11.135))) * 24634.6345);
                 float tri = r1 + r2 - 1.0; // triangular PDF, range [-1, +1]
@@ -525,8 +530,9 @@ struct QuadFragmentInput {
 
 StructuredBuffer<Quad> quads: register(t1);
 
-QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint quad_id: SV_InstanceID) {
+QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint quad_id = batch_start_index + instance_id;
     Quad quad = quads[quad_id];
     float4 device_position = to_device_position(unit_vertex, quad.bounds);
 
@@ -875,8 +881,9 @@ struct ShadowFragmentInput {
 
 StructuredBuffer<Shadow> shadows: register(t1);
 
-ShadowVertexOutput shadow_vertex(uint vertex_id: SV_VertexID, uint shadow_id: SV_InstanceID) {
+ShadowVertexOutput shadow_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint shadow_id = batch_start_index + instance_id;
     Shadow shadow = shadows[shadow_id];
 
     Bounds bounds;
@@ -1080,8 +1087,9 @@ struct UnderlineFragmentInput {
 
 StructuredBuffer<Underline> underlines: register(t1);
 
-UnderlineVertexOutput underline_vertex(uint vertex_id: SV_VertexID, uint underline_id: SV_InstanceID) {
+UnderlineVertexOutput underline_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint underline_id = batch_start_index + instance_id;
     Underline underline = underlines[underline_id];
     float4 device_position = to_device_position(unit_vertex, underline.bounds);
     float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
@@ -1132,10 +1140,10 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
 struct MonochromeSprite {
     uint order;
     uint pad;
+    AtlasTile tile;
     Bounds bounds;
     Bounds content_mask;
     Hsla color;
-    AtlasTile tile;
     TransformationMatrix transformation;
 };
 
@@ -1155,8 +1163,9 @@ struct MonochromeSpriteFragmentInput {
 
 StructuredBuffer<MonochromeSprite> mono_sprites: register(t1);
 
-MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexID, uint sprite_id: SV_InstanceID) {
+MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint sprite_id = batch_start_index + instance_id;
     MonochromeSprite sprite = mono_sprites[sprite_id];
     float4 device_position =
         to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
@@ -1178,8 +1187,8 @@ float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Targe
     return float4(input.color.rgb, input.color.a * alpha_corrected);
 }
 
-MonochromeSpriteVertexOutput subpixel_sprite_vertex(uint vertex_id: SV_VertexID, uint sprite_id: SV_InstanceID) {
-    return monochrome_sprite_vertex(vertex_id, sprite_id);
+MonochromeSpriteVertexOutput subpixel_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    return monochrome_sprite_vertex(vertex_id, instance_id);
 }
 
 SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentInput input) {
@@ -1204,12 +1213,12 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 struct PolychromeSprite {
     uint order;
     uint pad;
+    AtlasTile tile;
     uint grayscale;
     float opacity;
     Bounds bounds;
     Bounds content_mask;
     Corners corner_radii;
-    AtlasTile tile;
 };
 
 struct PolychromeSpriteVertexOutput {
@@ -1227,8 +1236,9 @@ struct PolychromeSpriteFragmentInput {
 
 StructuredBuffer<PolychromeSprite> poly_sprites: register(t1);
 
-PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexID, uint sprite_id: SV_InstanceID) {
+PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint sprite_id = batch_start_index + instance_id;
     PolychromeSprite sprite = poly_sprites[sprite_id];
     float4 device_position = to_device_position(unit_vertex, sprite.bounds);
     float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
@@ -1249,129 +1259,10 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     float4 color = sample;
-    if ((sprite.grayscale & 0xFFu) != 0u) {
+    if (sprite.grayscale != 0u) {
         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = float4(grayscale, sample.a);
     }
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
-}
-
-/*
-**
-**              Blur (backdrop-filter / filter)
-**
-** Shared by backdrop and content blur. The source texture is bound at t0 (t_sprite) and the
-** parameters in the BlurParams constant buffer at b1. Three passes: downsample (full -> half
-** res), separable gaussian (run twice), and a composite into a rounded rectangle.
-*/
-
-cbuffer BlurParams: register(b1) {
-    Bounds blur_bounds;
-    Bounds blur_content_mask;
-    float4 blur_corner_radii;
-    float2 blur_direction;
-    float blur_sigma;
-    float blur_opacity;
-    float blur_tap_count;
-    float blur_clip_rounded;
-    // 1.0 = snapped 2:1 box downsample (anchor the half-res grid to a fixed 2px grid at the origin
-    // so a stationary element blurs identically at every window size); 0.0 = 1:1 copy (scene blit).
-    float blur_downsample;
-    // Spacing between taps in pixels (gaussian passes only); >1 lets `blur_tap_count` taps span
-    // very large radii without truncating the gaussian.
-    float blur_tap_step;
-};
-
-struct BlurVertexOutput {
-    float4 position: SV_Position;
-    float2 uv: TEXCOORD0;
-};
-
-BlurVertexOutput blur_fullscreen(uint vertex_id) {
-    float2 uv = float2(float((vertex_id << 1u) & 2u), float(vertex_id & 2u));
-    BlurVertexOutput output;
-    output.uv = uv;
-    output.position = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
-    return output;
-}
-
-BlurVertexOutput blur_downsample_vertex(uint vertex_id: SV_VertexID) {
-    return blur_fullscreen(vertex_id);
-}
-
-float4 blur_downsample_fragment(BlurVertexOutput input): SV_Target {
-    if (blur_downsample > 0.5) {
-        // Snapped 2:1 box downsample. Half-res texel `px` samples source at full-res coordinate
-        // 2*px + 1 (the boundary between source texels 2*px and 2*px+1), so one bilinear tap
-        // averages exactly that pair. Anchored to the origin and independent of the viewport size,
-        // so an element at fixed pixels blurs identically at every window size — otherwise the
-        // implicit floor(W/2) grid stretches and the halo wobbles by ~1px on resize.
-        uint sw, sh;
-        t_sprite.GetDimensions(sw, sh);
-        float2 src_uv = (floor(input.position.xy) * 2.0 + 1.0) / float2(sw, sh);
-        return t_sprite.SampleLevel(s_sprite, src_uv, 0.0);
-    }
-    // 1:1 copy at matching resolution (used to blit the offscreen scene into the swapchain).
-    return t_sprite.SampleLevel(s_sprite, input.uv, 0.0);
-}
-
-BlurVertexOutput blur_vertex(uint vertex_id: SV_VertexID) {
-    return blur_fullscreen(vertex_id);
-}
-
-float4 blur_fragment(BlurVertexOutput input): SV_Target {
-    int taps = int(blur_tap_count);
-    float4 color = float4(0.0, 0.0, 0.0, 0.0);
-    float weight_sum = 0.0;
-    [loop]
-    for (int i = -taps; i <= taps; i++) {
-        float offset = float(i) * blur_tap_step;
-        float weight = gaussian(offset, blur_sigma);
-        color += t_sprite.SampleLevel(s_sprite, input.uv + blur_direction * offset, 0.0) * weight;
-        weight_sum += weight;
-    }
-    return color / max(weight_sum, 1e-5);
-}
-
-struct BlurCompositeVertexOutput {
-    float4 position: SV_Position;
-    float4 clip_distance: SV_ClipDistance;
-};
-
-struct BlurCompositeFragmentInput {
-    float4 position: SV_Position;
-};
-
-BlurCompositeVertexOutput blur_composite_vertex(uint vertex_id: SV_VertexID) {
-    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
-    BlurCompositeVertexOutput output;
-    output.position = to_device_position(unit_vertex, blur_bounds);
-    output.clip_distance = distance_from_clip_rect(unit_vertex, blur_bounds, blur_content_mask);
-    return output;
-}
-
-float4 blur_composite_fragment(BlurCompositeFragmentInput input): SV_Target {
-    // Sample the half-res blur by screen position, on the SAME fixed 2:1 grid the snapped downsample
-    // wrote (anchored at the origin, independent of viewport parity): 2 * the half-res texture size
-    // maps screen pixel p to half-res texel p/2 at every window size, so it doesn't wobble on resize.
-    uint hw, hh;
-    t_sprite.GetDimensions(hw, hh);
-    float2 uv = input.position.xy / (2.0 * float2(hw, hh));
-    float4 blurred = t_sprite.SampleLevel(s_sprite, uv, 0.0);
-    Corners radii;
-    radii.top_left = blur_corner_radii.x;
-    radii.top_right = blur_corner_radii.y;
-    radii.bottom_right = blur_corner_radii.z;
-    radii.bottom_left = blur_corner_radii.w;
-    float distance = quad_sdf(input.position.xy, blur_bounds, radii);
-    // Backdrop clips to the rounded rect (the panel has a defined shape); content blur bleeds past
-    // its bounds like CSS `filter: blur`, so its shape comes from the blurred group's own alpha.
-    float coverage = blur_clip_rounded > 0.5 ? saturate(0.5 - distance) : 1.0;
-    // The blurred sample is premultiplied (blurring against the transparent surround scales rgb
-    // with the fading alpha), so output premultiplied and use a premultiplied-blend state. A
-    // backdrop's scene is opaque (so this replaces); a content-filter group is transparent outside
-    // its subtree (so the target shows through there instead of darkening).
-    float a = coverage * blur_opacity;
-    return float4(blurred.rgb * a, blurred.a * a);
 }
