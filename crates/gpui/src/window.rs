@@ -1526,9 +1526,12 @@ impl Window {
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
                                 }
+                                let started = std::time::Instant::now();
                                 let arena_clear_needed = window.draw(cx);
+                                let drawn = std::time::Instant::now();
                                 window.present();
                                 arena_clear_needed.clear();
+                                frame_timing::log_if_slow(started, drawn);
                             })
                             .log_err();
                     })
@@ -2780,8 +2783,10 @@ impl Window {
         };
 
         // Layout all root elements.
+        frame_timing::mark(0);
         let mut root_element = self.root.as_ref().unwrap().clone().into_any();
         root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+        frame_timing::mark(1);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
@@ -2810,7 +2815,9 @@ impl Window {
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
+        frame_timing::mark(2);
         root_element.paint(self, cx);
+        frame_timing::mark(3);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
@@ -6568,5 +6575,63 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+/// `GPUI_SLOW_LOG_MS=<ms>`: frames taking longer are printed to stderr by phase.
+mod frame_timing {
+    use std::{
+        cell::Cell,
+        time::{Duration, Instant},
+    };
+
+    thread_local! {
+        static MARKS: Cell<[Option<Instant>; 4]> = const { Cell::new([None; 4]) };
+    }
+
+    fn threshold() -> Option<Duration> {
+        static AT: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+        *AT.get_or_init(|| {
+            let ms = std::env::var("GPUI_SLOW_LOG_MS")
+                .ok()?
+                .parse::<u64>()
+                .ok()?;
+            Some(Duration::from_millis(ms))
+        })
+    }
+
+    /// The draw reached phase `at`: 0 before the root's layout and prepaint, 1 after it,
+    /// 2 before painting, 3 after.
+    pub(super) fn mark(at: usize) {
+        if threshold().is_some() {
+            MARKS.with(|marks| {
+                let mut now = marks.get();
+                now[at] = Some(Instant::now());
+                marks.set(now);
+            });
+        }
+    }
+
+    pub(super) fn log_if_slow(started: Instant, drawn: Instant) {
+        let Some(at) = threshold() else { return };
+        let end = Instant::now();
+        let marks = MARKS.with(|marks| marks.replace([None; 4]));
+        if end - started <= at {
+            return;
+        }
+        let ms = |a: Option<Instant>, b: Option<Instant>| match (a, b) {
+            (Some(a), Some(b)) => format!("{:.1}", (b - a).as_secs_f64() * 1e3),
+            _ => "?".into(),
+        };
+        eprintln!(
+            "gpui slow draw {:.1} ms: before {} layout+prepaint {} between {} paint {} after {} present {}",
+            (end - started).as_secs_f64() * 1e3,
+            ms(Some(started), marks[0]),
+            ms(marks[0], marks[1]),
+            ms(marks[1], marks[2]),
+            ms(marks[2], marks[3]),
+            ms(marks[3], Some(drawn)),
+            ms(Some(drawn), Some(end)),
+        );
     }
 }

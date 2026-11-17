@@ -513,6 +513,12 @@ impl WgpuRenderer {
             alpha_mode,
             view_formats: vec![],
         };
+        if std::env::var_os("GPUI_SLOW_LOG_MS").is_some() {
+            eprintln!(
+                "gpui surface present mode {:?} (supported {:?})",
+                surface_config.present_mode, surface_caps.present_modes
+            );
+        }
         // Configure the surface immediately. The adapter selection process already validated
         // that this adapter can successfully configure this surface.
         surface.configure(&context.device, &surface_config);

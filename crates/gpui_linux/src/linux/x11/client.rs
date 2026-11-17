@@ -337,6 +337,7 @@ impl X11Client {
                             let end = Instant::now();
                             timing.end = Some(end);
                             profiler::add_task_timing(timing);
+                            log_if_slow("task", start, || format!("{location}"));
                         });
                     }
                 }
@@ -669,7 +670,10 @@ impl X11Client {
                 let mut state = self.0.borrow_mut();
                 if !state.has_xim() {
                     drop(state);
+                    let start = Instant::now();
+                    let name = slow_log_threshold().map(|_| event_name(&event));
                     self.handle_event(event);
+                    log_if_slow("event", start, || name.unwrap_or_default());
                     continue;
                 }
 
@@ -1997,10 +2001,12 @@ impl X11ClientState {
                             );
                             let window = window.window.clone();
                             drop(state);
+                            let start = Instant::now();
                             window.refresh(RequestFrameOptions {
                                 require_presentation: expose_event_received,
                                 force_render,
                             });
+                            log_if_slow("frame", start, String::new);
                         }
                         xcb_connection
                     };
@@ -3125,4 +3131,38 @@ mod tests {
         // Assert pressing space while on the Czech layout still types a space.
         assert_eq!(key_event_state.key_get_utf8(space), " ");
     }
+}
+
+/// `GPUI_SLOW_LOG_MS=<ms>`: main thread work (a foreground task, a frame, an X11 event)
+/// taking longer is printed to stderr with what it was.
+fn slow_log_threshold() -> Option<Duration> {
+    static AT: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        let ms = std::env::var("GPUI_SLOW_LOG_MS")
+            .ok()?
+            .parse::<u64>()
+            .ok()?;
+        Some(Duration::from_millis(ms))
+    })
+}
+
+fn log_if_slow(kind: &str, start: Instant, what: impl FnOnce() -> String) {
+    if let Some(at) = slow_log_threshold() {
+        let took = start.elapsed();
+        if took > at {
+            eprintln!(
+                "gpui slow {kind} {:.1} ms {}",
+                took.as_secs_f64() * 1e3,
+                what()
+            );
+        }
+    }
+}
+
+fn event_name(event: &Event) -> String {
+    let text = format!("{event:?}");
+    text.split(['(', ' ', '{'])
+        .next()
+        .unwrap_or_default()
+        .to_owned()
 }
