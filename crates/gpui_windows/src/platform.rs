@@ -330,7 +330,7 @@ impl WindowsPlatform {
         #[cfg(not(feature = "wgpu"))]
         let invalidate_devices = self.invalidate_devices.clone();
 
-        if let Err(error) = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("VSyncProvider".to_owned())
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
@@ -348,12 +348,7 @@ impl WindowsPlatform {
                                 &all_windows,
                                 &text_system,
                             ) {
-                                record_isolated_failure(
-                                    "gpui",
-                                    "device_lost",
-                                    &format!("Device lost: {err}"),
-                                );
-                                break;
+                                panic!("Device lost: {err}");
                             }
                         }
                     }
@@ -367,13 +362,7 @@ impl WindowsPlatform {
                     }
                 }
             })
-        {
-            record_isolated_failure(
-                "gpui",
-                "vsync_thread",
-                &format!("failed to start VSync provider: {error}"),
-            );
-        }
+            .unwrap();
     }
 }
 
@@ -1416,9 +1405,15 @@ unsafe extern "system" fn window_procedure(
     }
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
-        isolate_window_message(hwnd, msg, wparam, lparam, || {
+        if cfg!(debug_assertions) {
+            let inner = std::panic::AssertUnwindSafe(inner);
+            match std::panic::catch_unwind(|| { inner }.handle_msg(hwnd, msg, wparam, lparam)) {
+                Ok(result) => result,
+                Err(_) => std::process::abort(),
+            }
+        } else {
             inner.handle_msg(hwnd, msg, wparam, lparam)
-        })
+        }
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     };

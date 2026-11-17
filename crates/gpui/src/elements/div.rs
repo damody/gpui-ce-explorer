@@ -2408,6 +2408,15 @@ impl Interactivity {
         window: &mut Window,
         cx: &mut App,
     ) {
+        if let Some(id) = self.element_id.as_ref() {
+            let clickable = !self.click_listeners.is_empty()
+                || !self.mouse_down_listeners.is_empty()
+                || !self.mouse_up_listeners.is_empty();
+            let focusable = self.tracked_focus_handle.is_some();
+            if clickable || focusable {
+                window.record_automation_target(id, hitbox.bounds, clickable, focusable);
+            }
+        }
         let is_focused = self
             .tracked_focus_handle
             .as_ref()

@@ -1702,6 +1702,11 @@ impl PlatformWindow for X11Window {
         }
     }
 
+    fn capture_next_frame(&self, done: gpui::FrameCaptureCallback) -> bool {
+        self.0.state.borrow_mut().renderer.request_capture(done);
+        true
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         let inner = self.0.state.borrow();
         inner.renderer.sprite_atlas().clone()

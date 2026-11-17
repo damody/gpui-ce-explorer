@@ -69,7 +69,6 @@ impl PlatformAtlas for MetalAtlas {
             AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
             AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
             AtlasTextureKind::Subpixel => unreachable!(),
-            AtlasTextureKind::Bc7Icon | AtlasTextureKind::Bc7Thumbnail => unreachable!(),
         };
 
         let Some(texture_slot) = textures
@@ -102,7 +101,6 @@ impl MetalAtlasState {
                 AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
                 AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
                 AtlasTextureKind::Subpixel => unreachable!(),
-                AtlasTextureKind::Bc7Icon | AtlasTextureKind::Bc7Thumbnail => unreachable!(),
             };
 
             if let Some(tile) = textures
@@ -148,7 +146,6 @@ impl MetalAtlasState {
                 usage = metal::MTLTextureUsage::ShaderRead;
             }
             AtlasTextureKind::Subpixel => unreachable!(),
-            AtlasTextureKind::Bc7Icon | AtlasTextureKind::Bc7Thumbnail => unreachable!(),
         }
         texture_descriptor.set_pixel_format(pixel_format);
         texture_descriptor.set_usage(usage);
@@ -165,7 +162,6 @@ impl MetalAtlasState {
             AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
             AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
             AtlasTextureKind::Subpixel => unreachable!(),
-            AtlasTextureKind::Bc7Icon | AtlasTextureKind::Bc7Thumbnail => unreachable!(),
         };
 
         let index = texture_list.free_list.pop();
@@ -197,7 +193,6 @@ impl MetalAtlasState {
             AtlasTextureKind::Monochrome => &self.monochrome_textures,
             AtlasTextureKind::Polychrome => &self.polychrome_textures,
             AtlasTextureKind::Subpixel => unreachable!(),
-            AtlasTextureKind::Bc7Icon | AtlasTextureKind::Bc7Thumbnail => unreachable!(),
         };
         textures[id.index as usize].as_ref().unwrap()
     }
@@ -290,7 +285,6 @@ mod tests {
         AtlasKey::Image(gpui::RenderImageParams {
             image_id: gpui::ImageId(image_id),
             frame_index,
-            compressed_bc7_srgb: None,
         })
     }
 

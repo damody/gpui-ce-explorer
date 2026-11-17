@@ -1,5 +1,6 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+use crate::{MouseDownEvent, ScrollDelta, ScrollWheelEvent, TouchPhase};
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds, BoxShadow,
@@ -813,6 +814,31 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    pub(crate) automation_targets: Vec<AutomationTarget>,
+    pub(crate) automation_texts: Vec<AutomationText>,
+}
+
+/// An interactive element painted in the last frame, recorded so automation
+/// (tests, MCP) can find and operate it the way a pointer would.
+#[derive(Clone, Debug)]
+pub struct AutomationTarget {
+    /// The element's own id (not the full path), e.g. `mperf.start`.
+    pub id: SharedString,
+    /// Visible bounds in window coordinates, clipped to the content mask.
+    pub bounds: Bounds<Pixels>,
+    /// Whether the element reacts to clicks.
+    pub clickable: bool,
+    /// Whether clicking focuses the element (text inputs, lists).
+    pub focusable: bool,
+}
+
+/// A line of text painted in the last frame with its visible bounds.
+#[derive(Clone, Debug)]
+pub struct AutomationText {
+    /// The shaped text.
+    pub text: SharedString,
+    /// Visible bounds in window coordinates, clipped to the content mask.
+    pub bounds: Bounds<Pixels>,
 }
 
 #[derive(Clone, Default)]
@@ -833,6 +859,8 @@ pub(crate) struct PaintIndex {
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
+    automation_targets_index: usize,
+    automation_texts_index: usize,
     line_layout_index: LineLayoutIndex,
 }
 
@@ -862,6 +890,8 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            automation_targets: Vec::new(),
+            automation_texts: Vec::new(),
         }
     }
 
@@ -878,6 +908,8 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
+        self.automation_targets.clear();
+        self.automation_texts.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -985,6 +1017,8 @@ pub struct Window {
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
+    /// Whether painting records interactive elements and text for automation.
+    automation_recording: bool,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -1378,8 +1412,9 @@ impl Window {
             cx.foreground_executor()
                 .spawn(async move {
                     while activation_receiver.recv().await.is_ok() {
-                        // The window may already be gone (startup splash, closed popups).
-                        let _ = handle.update(&mut async_cx, |_, window, _| window.refresh());
+                        handle
+                            .update(&mut async_cx, |_, window, _| window.refresh())
+                            .log_err();
                     }
                 })
                 .detach();
@@ -1388,7 +1423,9 @@ impl Window {
             cx.foreground_executor()
                 .spawn(async move {
                     while deactivation_receiver.recv().await.is_ok() {
-                        let _ = handle.update(&mut async_cx, |_, window, _| window.refresh());
+                        handle
+                            .update(&mut async_cx, |_, window, _| window.refresh())
+                            .log_err();
                     }
                 })
                 .detach();
@@ -1397,9 +1434,11 @@ impl Window {
             cx.foreground_executor()
                 .spawn(async move {
                     while let Ok(request) = action_receiver.recv().await {
-                        let _ = handle.update(&mut async_cx, |_, window, cx| {
-                            window.handle_a11y_action(request, cx);
-                        });
+                        handle
+                            .update(&mut async_cx, |_, window, cx| {
+                                window.handle_a11y_action(request, cx);
+                            })
+                            .log_err();
                     }
                 })
                 .detach();
@@ -1676,6 +1715,7 @@ impl Window {
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            automation_recording: false,
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -3060,6 +3100,8 @@ impl Window {
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
+            automation_targets_index: self.next_frame.automation_targets.len(),
+            automation_texts_index: self.next_frame.automation_texts.len(),
             line_layout_index: self.text_system.layout_index(),
         }
     }
@@ -3092,6 +3134,14 @@ impl Window {
         self.next_frame.tab_stops.replay(
             &self.rendered_frame.tab_stops.insertion_history
                 [range.start.tab_handle_index..range.end.tab_handle_index],
+        );
+        self.next_frame.automation_targets.extend_from_slice(
+            &self.rendered_frame.automation_targets
+                [range.start.automation_targets_index..range.end.automation_targets_index],
+        );
+        self.next_frame.automation_texts.extend_from_slice(
+            &self.rendered_frame.automation_texts
+                [range.start.automation_texts_index..range.end.automation_texts_index],
         );
 
         self.text_system
@@ -4149,23 +4199,11 @@ impl Window {
         let params = RenderImageParams {
             image_id: data.id,
             frame_index,
-            compressed_bc7_srgb: data.compressed_raster().map(|raster| raster.kind),
         };
 
-        let key = params.into();
-        let tile = if let Some(compressed) = data.compressed_raster() {
-            self.sprite_atlas.get_or_insert_bc7(
-                &key,
-                data.size(frame_index),
-                size(
-                    compressed.padded_width.into(),
-                    compressed.padded_height.into(),
-                ),
-                compressed.row_pitch,
-                &compressed.blocks,
-            )?
-        } else {
-            self.sprite_atlas.get_or_insert_with(&key, &mut || {
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(&params.into(), &mut || {
                 Ok(Some((
                     data.size(frame_index),
                     Cow::Borrowed(
@@ -4174,8 +4212,7 @@ impl Window {
                     ),
                 )))
             })?
-        }
-        .expect("Callback above only returns Some");
+            .expect("Callback above only returns Some");
         let content_mask = self.snapped_content_mask();
         let corner_radii = corner_radii.scale(self.scale_factor());
         let opacity = self.element_opacity();
@@ -4244,7 +4281,6 @@ impl Window {
             let params = RenderImageParams {
                 image_id: data.id,
                 frame_index,
-                compressed_bc7_srgb: data.compressed_raster().map(|raster| raster.kind),
             };
 
             self.sprite_atlas.remove(&params.clone().into());
@@ -4577,6 +4613,140 @@ impl Window {
                 .unwrap_or(CursorStyle::Arrow);
             cx.platform.set_cursor_style(style);
         }
+    }
+
+    /// Start or stop recording interactive elements and painted text each
+    /// frame for [`Self::automation_targets`] and [`Self::automation_texts`].
+    /// Off by default so windows without automation pay nothing; takes effect
+    /// from the next frame.
+    pub fn set_automation_recording(&mut self, enabled: bool) {
+        if self.automation_recording != enabled {
+            self.automation_recording = enabled;
+            self.refresh();
+        }
+    }
+
+    /// Record an interactive element for automation. Called while painting.
+    pub(crate) fn record_automation_target(
+        &mut self,
+        id: &ElementId,
+        bounds: Bounds<Pixels>,
+        clickable: bool,
+        focusable: bool,
+    ) {
+        if !self.automation_recording {
+            return;
+        }
+        let Some(bounds) = self.automation_visible_bounds(bounds) else {
+            return;
+        };
+        self.next_frame.automation_targets.push(AutomationTarget {
+            id: id.to_string().into(),
+            bounds,
+            clickable,
+            focusable,
+        });
+    }
+
+    /// Record painted text for automation. Called while painting.
+    pub(crate) fn record_automation_text(&mut self, text: &SharedString, bounds: Bounds<Pixels>) {
+        if !self.automation_recording || text.trim().is_empty() {
+            return;
+        }
+        let Some(bounds) = self.automation_visible_bounds(bounds) else {
+            return;
+        };
+        self.next_frame.automation_texts.push(AutomationText {
+            text: text.clone(),
+            bounds,
+        });
+    }
+
+    fn automation_visible_bounds(&self, bounds: Bounds<Pixels>) -> Option<Bounds<Pixels>> {
+        let visible = bounds.intersect(&self.content_mask().bounds);
+        (visible.size.width > px(0.) && visible.size.height > px(0.)).then_some(visible)
+    }
+
+    /// Capture the next frame this window presents, as rendered on screen.
+    /// `None` when the platform renderer cannot read frames back.
+    pub fn capture_frame(&mut self) -> Option<oneshot::Receiver<Result<image::RgbaImage>>> {
+        let (tx, rx) = oneshot::channel();
+        let accepted = self.platform_window.capture_next_frame(Box::new(move |result| {
+            let image = result.and_then(|(width, height, pixels)| {
+                image::RgbaImage::from_raw(width, height, pixels)
+                    .ok_or_else(|| anyhow!("captured frame size does not match its pixels"))
+            });
+            let _ = tx.send(image);
+        }));
+        if !accepted {
+            return None;
+        }
+        self.refresh();
+        Some(rx)
+    }
+
+    /// Interactive elements painted in the last rendered frame, in paint order
+    /// (later entries are on top).
+    pub fn automation_targets(&self) -> &[AutomationTarget] {
+        &self.rendered_frame.automation_targets
+    }
+
+    /// Text lines painted in the last rendered frame, in paint order.
+    pub fn automation_texts(&self) -> &[AutomationText] {
+        &self.rendered_frame.automation_texts
+    }
+
+    /// Click at a window position exactly as a pointer would: move, press, release.
+    pub fn simulate_click(&mut self, position: Point<Pixels>, cx: &mut App) {
+        let modifiers = Modifiers::default();
+        self.dispatch_event(
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers,
+            }),
+            cx,
+        );
+        self.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        self.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers,
+                click_count: 1,
+            }),
+            cx,
+        );
+    }
+
+    /// Scroll the element under a window position as a mouse wheel would.
+    pub fn simulate_scroll(&mut self, position: Point<Pixels>, delta: Point<Pixels>, cx: &mut App) {
+        self.dispatch_event(
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers: Modifiers::default(),
+            }),
+            cx,
+        );
+        self.dispatch_event(
+            PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(delta),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            }),
+            cx,
+        );
     }
 
     /// Dispatch a given keystroke as though the user had typed it.

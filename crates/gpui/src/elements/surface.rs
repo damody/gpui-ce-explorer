@@ -68,6 +68,10 @@ pub struct Surface {
 }
 
 /// Create a new surface element.
+#[allow(
+    unreachable_code,
+    reason = "SurfaceSource is intentionally uninhabited on platforms without a surface backend"
+)]
 pub fn surface(source: impl Into<SurfaceSource>) -> Surface {
     Surface {
         source: source.into(),

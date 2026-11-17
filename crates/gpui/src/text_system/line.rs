@@ -100,6 +100,14 @@ impl ShapedLine {
             window,
             cx,
         )?;
+        let width = match align {
+            TextAlign::Left => self.layout.width,
+            _ => align_width.unwrap_or(self.layout.width),
+        };
+        window.record_automation_text(
+            &self.text,
+            Bounds::new(origin, size(width, line_height)),
+        );
 
         Ok(())
     }
@@ -310,6 +318,13 @@ impl WrappedLine {
             window,
             cx,
         )?;
+        let mut extent = self.layout.size(line_height);
+        if align != TextAlign::Left
+            && let Some(width) = align_width
+        {
+            extent.width = width;
+        }
+        window.record_automation_text(&self.text, Bounds::new(origin, extent));
 
         Ok(())
     }

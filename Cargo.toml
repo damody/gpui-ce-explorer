@@ -19,7 +19,6 @@ members = [
   "./crates/gpui_media/",
   "./crates/gpui_zed_util/",
   "./crates/gpui_ce_util/",
-  "./tooling/perf/",
 ]
 default-members = ["./crates/gpui/"]
 resolver = "3"

@@ -1430,6 +1430,11 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
+    fn capture_next_frame(&self, done: gpui::FrameCaptureCallback) -> bool {
+        self.borrow_mut().renderer.request_capture(done);
+        true
+    }
+
     fn completed_frame(&self) {
         let mut state = self.borrow_mut();
 

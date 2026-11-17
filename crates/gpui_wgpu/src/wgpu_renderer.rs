@@ -22,9 +22,43 @@ fn max_blur_radius(filters: &[ScaledFilter]) -> f32 {
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+
+fn instance_data_signature(data: &[u8]) -> (u64, u64) {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hasher);
+    ((data.len() as u64).max(16), hasher.finish())
+}
+
+/// Cache of buffer ranges keyed by start offset, valued by (size, hash).
+/// Ranges never overlap: every real upload evicts the entries it overwrites.
+type InstanceUploadCache = BTreeMap<u64, (u64, u64)>;
+
+fn instance_upload_required(cache: &mut InstanceUploadCache, offset: u64, data: &[u8]) -> bool {
+    let signature = instance_data_signature(data);
+    if cache.get(&offset) == Some(&signature) {
+        return false;
+    }
+    // A write that differs in size or position overwrites bytes that earlier
+    // entries describe. Those entries must go, or a later identical write at
+    // their offset would be skipped while the buffer holds other data.
+    let end = offset + signature.0;
+    let overlapping = cache
+        .range(..end)
+        .rev()
+        .take_while(|(start, (size, _))| **start + *size > offset)
+        .map(|(start, _)| *start)
+        .collect::<Vec<_>>();
+    for start in overlapping {
+        cache.remove(&start);
+    }
+    cache.insert(offset, signature);
+    true
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -226,6 +260,17 @@ const MAX_FILTER_DEPTH: usize = 2;
 /// Each frame uses 4 passes per backdrop/group plus one blit; 256 covers dozens of filters.
 const BLUR_PARAMS_SLOTS: u64 = 256;
 
+/// A frame copy in flight from the surface texture to host memory.
+struct FrameReadback {
+    buffer: wgpu::Buffer,
+    width: u32,
+    height: u32,
+    /// Bytes per row in the buffer, padded to wgpu's copy alignment.
+    padded_row: u32,
+    /// The surface stores BGRA; swap to RGBA.
+    bgra: bool,
+}
+
 pub struct WgpuRenderer {
     /// Shared GPU context for device recovery coordination (unused on WASM).
     #[allow(dead_code)]
@@ -244,6 +289,11 @@ pub struct WgpuRenderer {
     instance_buffer_capacity: u64,
     max_buffer_size: u64,
     storage_buffer_alignment: u64,
+    /// Retains unchanged instance ranges across frames. Offsets are deterministic for an
+    /// unchanged scene, so identical bytes do not need another queue write.
+    instance_upload_cache: Mutex<InstanceUploadCache>,
+    instance_upload_hits: std::sync::atomic::AtomicU64,
+    instance_upload_misses: std::sync::atomic::AtomicU64,
     /// Stride between [`BlurParams`] slots in `blur_params_buffer`, and a per-frame bump cursor
     /// (in slots) handed out to blur passes. Cell so the `&self` blur helpers can advance it.
     blur_params_stride: u64,
@@ -259,6 +309,10 @@ pub struct WgpuRenderer {
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
+    /// Whether presented frames can be copied out (surface supports COPY_SRC).
+    surface_copy_src: bool,
+    /// Requests for the next presented frame.
+    capture_waiters: Vec<gpui::FrameCaptureCallback>,
     needs_redraw: bool,
 }
 
@@ -440,8 +494,14 @@ impl WgpuRenderer {
             );
         }
 
+        // COPY_SRC lets automation read presented frames back (capture_frame).
+        let surface_copy_src = surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if surface_copy_src {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -622,6 +682,9 @@ impl WgpuRenderer {
             instance_buffer_capacity: initial_instance_buffer_capacity,
             max_buffer_size,
             storage_buffer_alignment,
+            instance_upload_cache: Mutex::new(InstanceUploadCache::new()),
+            instance_upload_hits: std::sync::atomic::AtomicU64::new(0),
+            instance_upload_misses: std::sync::atomic::AtomicU64::new(0),
             blur_params_stride,
             blur_params_slot: std::cell::Cell::new(0),
             rendering_params,
@@ -635,6 +698,8 @@ impl WgpuRenderer {
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
             surface_configured: true,
+            surface_copy_src,
+            capture_waiters: Vec::new(),
             needs_redraw: false,
         })
     }
@@ -1750,11 +1815,108 @@ impl WgpuRenderer {
                 self.blit_to_frame(&mut encoder, scene_color_view, &frame_view);
             }
 
+            let capture = (!self.capture_waiters.is_empty())
+                .then(|| self.encode_frame_capture(&mut encoder, &frame.texture));
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
             frame.present();
+            if let Some(capture) = capture {
+                self.finish_frame_capture(capture);
+            }
             return true;
+        }
+    }
+
+    /// Ask for the next presented frame to be read back.
+    pub fn request_capture(&mut self, done: gpui::FrameCaptureCallback) {
+        self.capture_waiters.push(done);
+    }
+
+    /// Record a copy of the frame texture into a readback buffer.
+    fn encode_frame_capture(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+    ) -> Result<FrameReadback, String> {
+        if !self.surface_copy_src {
+            return Err("this window surface cannot be read back (no COPY_SRC)".into());
+        }
+        let (width, height) = (texture.width(), texture.height());
+        let padded_row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = self
+            .resources()
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("frame_capture"),
+                size: u64::from(padded_row) * u64::from(height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            texture.size(),
+        );
+        Ok(FrameReadback {
+            buffer,
+            width,
+            height,
+            padded_row,
+            bgra: matches!(
+                texture.format(),
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+            ),
+        })
+    }
+
+    /// Wait for the submitted copy, convert it to RGBA8 and answer every waiter.
+    fn finish_frame_capture(&mut self, capture: Result<FrameReadback, String>) {
+        let result = capture.and_then(|readback| {
+            let slice = readback.buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            self.resources()
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_secs(5)),
+                })
+                .map_err(|error| format!("frame readback did not finish: {error:?}"))?;
+            rx.recv()
+                .map_err(|_| "frame readback was dropped".to_string())?
+                .map_err(|error| format!("frame readback failed: {error}"))?;
+            let mapped = slice.get_mapped_range();
+            let row = readback.width as usize * 4;
+            let mut pixels = Vec::with_capacity(row * readback.height as usize);
+            for line in mapped.chunks(readback.padded_row as usize).take(readback.height as usize) {
+                pixels.extend_from_slice(&line[..row]);
+            }
+            drop(mapped);
+            readback.buffer.unmap();
+            if readback.bgra {
+                for pixel in pixels.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+            }
+            Ok((readback.width, readback.height, pixels))
+        });
+        for done in self.capture_waiters.drain(..) {
+            done(
+                result
+                    .as_ref()
+                    .map(|(width, height, pixels)| (*width, *height, pixels.clone()))
+                    .map_err(|error| anyhow::anyhow!("{error}")),
+            );
         }
     }
 
@@ -2415,6 +2577,10 @@ impl WgpuRenderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        self.instance_upload_cache
+            .lock()
+            .expect("instance upload cache poisoned")
+            .clear();
         self.instance_buffer_capacity = new_capacity;
     }
 
@@ -2428,12 +2594,38 @@ impl WgpuRenderer {
         if offset + size > self.instance_buffer_capacity {
             return None;
         }
-        let resources = self.resources();
-        resources
-            .queue
-            .write_buffer(&resources.instance_buffer, offset, data);
+        let upload_required = instance_upload_required(
+            &mut self
+                .instance_upload_cache
+                .lock()
+                .expect("instance upload cache poisoned"),
+            offset,
+            data,
+        );
+        if !upload_required {
+            self.instance_upload_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            let resources = self.resources();
+            resources
+                .queue
+                .write_buffer(&resources.instance_buffer, offset, data);
+            self.instance_upload_misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         *instance_offset = offset + size;
         Some((offset, NonZeroU64::new(size).expect("size is at least 16")))
+    }
+
+    /// Number of instance-buffer uploads skipped and performed since renderer creation.
+    /// Used by performance diagnostics to prove retained unchanged ranges are effective.
+    pub fn instance_upload_stats(&self) -> (u64, u64) {
+        (
+            self.instance_upload_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.instance_upload_misses
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn instance_binding(&self, offset: u64, size: NonZeroU64) -> wgpu::BindingResource<'_> {
@@ -2672,5 +2864,50 @@ impl RenderingParameters {
             grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,
         }
+    }
+}
+
+#[cfg(test)]
+mod instance_upload_cache_tests {
+    use super::{InstanceUploadCache, instance_upload_required};
+
+    #[test]
+    fn unchanged_instance_range_is_retained_and_changes_are_uploaded() {
+        let mut cache = InstanceUploadCache::new();
+        assert!(instance_upload_required(&mut cache, 0, &[1, 2, 3, 4]));
+        assert!(!instance_upload_required(&mut cache, 0, &[1, 2, 3, 4]));
+        assert!(instance_upload_required(&mut cache, 0, &[1, 2, 3, 5]));
+        assert!(instance_upload_required(&mut cache, 256, &[1, 2, 3, 5]));
+        cache.clear();
+        assert!(instance_upload_required(&mut cache, 0, &[1, 2, 3, 5]));
+    }
+
+    #[test]
+    fn a_larger_write_invalidates_the_ranges_it_overwrites() {
+        let mut cache = InstanceUploadCache::new();
+        let small = [1u8; 64];
+        let other = [2u8; 64];
+        let large = [3u8; 256];
+        // Frame 1: two draws at 0 and 64.
+        assert!(instance_upload_required(&mut cache, 0, &small));
+        assert!(instance_upload_required(&mut cache, 64, &other));
+        // Frame 2: one larger draw at 0 overwrites bytes 64..128 too.
+        assert!(instance_upload_required(&mut cache, 0, &large));
+        // Frame 3: frame 1 again. Both ranges hold frame 2 data and must upload.
+        assert!(instance_upload_required(&mut cache, 0, &small));
+        assert!(instance_upload_required(&mut cache, 64, &other));
+        // Frame 4: unchanged frame 3 is retained.
+        assert!(!instance_upload_required(&mut cache, 0, &small));
+        assert!(!instance_upload_required(&mut cache, 64, &other));
+    }
+
+    #[test]
+    fn a_write_starting_inside_an_earlier_range_invalidates_it() {
+        let mut cache = InstanceUploadCache::new();
+        let large = [3u8; 256];
+        let small = [1u8; 64];
+        assert!(instance_upload_required(&mut cache, 0, &large));
+        assert!(instance_upload_required(&mut cache, 128, &small));
+        assert!(instance_upload_required(&mut cache, 0, &large));
     }
 }

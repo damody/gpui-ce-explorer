@@ -620,6 +620,9 @@ pub struct RequestFrameOptions {
     pub force_render: bool,
 }
 
+/// Receives the next presented frame as (width, height, RGBA8 pixels, row-major).
+pub type FrameCaptureCallback = Box<dyn FnOnce(anyhow::Result<(u32, u32, Vec<u8>)>)>;
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -664,6 +667,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Read back the next frame this window presents. Returns false when the
+    /// platform renderer cannot capture; `done` is then dropped uncalled.
+    fn capture_next_frame(&self, _done: FrameCaptureCallback) -> bool {
+        false
+    }
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
@@ -1041,16 +1049,6 @@ impl AtlasKey {
                 }
             }
             AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
-            AtlasKey::Image(params)
-                if params.compressed_bc7_srgb == Some(crate::CompressedRasterKind::Icon) =>
-            {
-                AtlasTextureKind::Bc7Icon
-            }
-            AtlasKey::Image(params)
-                if params.compressed_bc7_srgb == Some(crate::CompressedRasterKind::Thumbnail) =>
-            {
-                AtlasTextureKind::Bc7Thumbnail
-            }
             AtlasKey::Image(_) => AtlasTextureKind::Polychrome,
         }
     }
@@ -1082,18 +1080,6 @@ pub trait PlatformAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
-
-    /// Inserts a validated BC7 raster. Backends without native support fail closed.
-    fn get_or_insert_bc7(
-        &self,
-        _key: &AtlasKey,
-        _size: Size<DevicePixels>,
-        _padded_size: Size<DevicePixels>,
-        _row_pitch: u32,
-        _blocks: &[u8],
-    ) -> Result<Option<AtlasTile>> {
-        anyhow::bail!("BC7 textures are unsupported by this backend")
-    }
 }
 
 #[doc(hidden)]
@@ -1171,8 +1157,6 @@ pub enum AtlasTextureKind {
     Monochrome = 0,
     Polychrome = 1,
     Subpixel = 2,
-    Bc7Icon = 3,
-    Bc7Thumbnail = 4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

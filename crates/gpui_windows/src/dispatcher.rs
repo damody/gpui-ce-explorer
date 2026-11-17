@@ -113,12 +113,7 @@ impl PlatformDispatcher for WindowsDispatcher {
     fn dispatch(&self, runnable: RunnableVariant, priority: Priority) {
         let priority = match priority {
             Priority::RealtimeAudio => {
-                crate::record_isolated_failure(
-                    "gpui",
-                    "dispatch",
-                    "RealtimeAudio priority should use spawn_realtime, not dispatch",
-                );
-                return;
+                panic!("RealtimeAudio priority should use spawn_realtime, not dispatch")
             }
             Priority::High => WorkItemPriority::High,
             Priority::Medium => WorkItemPriority::Normal,

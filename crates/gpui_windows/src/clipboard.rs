@@ -49,15 +49,10 @@ static IMAGE_FORMATS_MAP: LazyLock<FxHashMap<u32, ImageFormat>> = LazyLock::new(
 fn register_clipboard_format(format: PCWSTR) -> u32 {
     let ret = unsafe { RegisterClipboardFormatW(format) };
     if ret == 0 {
-        crate::record_isolated_failure(
-            "gpui",
-            "clipboard_format",
-            &format!(
-                "Error when registering clipboard format: {}",
-                std::io::Error::last_os_error()
-            ),
+        panic!(
+            "Error when registering clipboard format: {}",
+            std::io::Error::last_os_error()
         );
-        return 0;
     }
     log::debug!(
         "Registered clipboard format {} as {}",
