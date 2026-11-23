@@ -23,20 +23,23 @@ fn max_blur_radius(filters: &[ScaledFilter]) -> f32 {
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-fn instance_data_signature(data: &[u8]) -> (u64, u64) {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    data.hash(&mut hasher);
-    ((data.len() as u64).max(16), hasher.finish())
+/// (size, hash) of an instance upload. xxh3-128: the whole instance buffer is hashed
+/// every frame, and SipHash cost several percent of the UI thread; 128 bits keep a
+/// collision (an upload skipped, stale instances drawn) negligible.
+fn instance_data_signature(data: &[u8]) -> (u64, u128) {
+    (
+        (data.len() as u64).max(16),
+        twox_hash::XxHash3_128::oneshot(data),
+    )
 }
 
 /// Cache of buffer ranges keyed by start offset, valued by (size, hash).
 /// Ranges never overlap: every real upload evicts the entries it overwrites.
-type InstanceUploadCache = BTreeMap<u64, (u64, u64)>;
+type InstanceUploadCache = BTreeMap<u64, (u64, u128)>;
 
 fn instance_upload_required(cache: &mut InstanceUploadCache, offset: u64, data: &[u8]) -> bool {
     let signature = instance_data_signature(data);

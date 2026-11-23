@@ -29,6 +29,7 @@ profiling.workspace = true
 raw-window-handle = "0.6"
 smallvec.workspace = true
 swash = "0.2.6"
+twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_128"] }
 unicode-segmentation.workspace = true
 gpui_util.workspace = true
 wgpu.workspace = true
