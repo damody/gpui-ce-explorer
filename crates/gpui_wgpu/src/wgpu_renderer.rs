@@ -356,12 +356,6 @@ impl WgpuRenderer {
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
 
-        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            // Fall back to the display handle already provided via InstanceDescriptor::display.
-            raw_display_handle: None,
-            raw_window_handle: window_handle.as_raw(),
-        };
-
         // Use the existing context's instance if available, otherwise create a new one.
         // The surface must be created with the same instance that will be used for
         // adapter selection, otherwise wgpu will panic.
@@ -374,24 +368,52 @@ impl WgpuRenderer {
         // Safety: The caller guarantees that the window handle is valid for the
         // lifetime of this renderer. In practice, the RawWindow struct is created
         // from the native window handles and the surface is dropped before the window.
-        let surface = unsafe {
+        let create_surface = |instance: &wgpu::Instance| unsafe {
             instance
-                .create_surface_unsafe(target)
-                .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    // Fall back to the display handle already provided via
+                    // InstanceDescriptor::display.
+                    raw_display_handle: None,
+                    raw_window_handle: window_handle.as_raw(),
+                })
+                .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))
         };
 
         let mut ctx_ref = gpu_context.borrow_mut();
-        let context = match ctx_ref.as_mut() {
+        let (surface, context) = match ctx_ref.as_mut() {
             Some(context) => {
+                let surface = create_surface(&instance)?;
                 context.check_compatible_with_surface(&surface)?;
-                context
+                (surface, context)
             }
-            None => ctx_ref.insert(WgpuContext::new(
-                instance,
-                &surface,
-                compositor_gpu,
-                extra_requirements.as_ref(),
-            )?),
+            None => {
+                let new_context = |instance: wgpu::Instance| {
+                    let surface = create_surface(&instance)?;
+                    let context = WgpuContext::new(
+                        instance,
+                        &surface,
+                        compositor_gpu,
+                        extra_requirements.as_ref(),
+                    )?;
+                    anyhow::Ok((surface, context))
+                };
+                let narrowed = wgpu::Backends::from_env()
+                    .is_some_and(|backends| backends != WgpuContext::default_backends());
+                let (surface, context) = match new_context(instance) {
+                    Ok(made) => made,
+                    // `WGPU_BACKEND` left out the backend that can draw this window:
+                    // choose among all of them, as without it.
+                    Err(error) if narrowed => {
+                        log::warn!("{error}; retrying with every backend");
+                        new_context(WgpuContext::instance_with(
+                            Box::new(window.clone()),
+                            WgpuContext::default_backends(),
+                        ))?
+                    }
+                    Err(error) => return Err(error),
+                };
+                (surface, ctx_ref.insert(context))
+            }
         };
 
         let atlas = Arc::new(WgpuAtlas::from_context(context));

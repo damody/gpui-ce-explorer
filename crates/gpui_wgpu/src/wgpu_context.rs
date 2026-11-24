@@ -207,13 +207,30 @@ impl WgpuContext {
         ))
     }
 
+    /// The backends gpui draws with unless `WGPU_BACKEND` names others.
     #[cfg(not(target_family = "wasm"))]
-    pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
+    pub fn default_backends() -> wgpu::Backends {
         #[cfg(not(target_os = "windows"))]
         let backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
         #[cfg(target_os = "windows")]
         let backends = wgpu::Backends::DX12;
+        backends
+    }
 
+    /// An instance of the backends `WGPU_BACKEND` names (wgpu's variable), or of
+    /// [`Self::default_backends`]. Naming only Vulkan skips the GL backend, which opens
+    /// EGL and loads its driver (Mesa: gallium) even when a Vulkan adapter is chosen.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
+        let backends = wgpu::Backends::from_env().unwrap_or_else(Self::default_backends);
+        Self::instance_with(display, backends)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub fn instance_with(
+        display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>,
+        backends: wgpu::Backends,
+    ) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
             flags: wgpu::InstanceFlags::default(),
