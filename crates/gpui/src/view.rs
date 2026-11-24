@@ -217,18 +217,20 @@ impl Element for AnyView {
                     |element_state, window| {
                         let mut element_state = element_state.unwrap();
 
-                        let paint_start = window.paint_index();
+                        window.with_recorded_paint(|window| {
+                            let paint_start = window.paint_index();
 
-                        if let Some(element) = element {
-                            let refreshing = mem::replace(&mut window.refreshing, true);
-                            element.paint(window, cx);
-                            window.refreshing = refreshing;
-                        } else {
-                            window.reuse_paint(element_state.paint_range.clone());
-                        }
+                            if let Some(element) = element {
+                                let refreshing = mem::replace(&mut window.refreshing, true);
+                                element.paint(window, cx);
+                                window.refreshing = refreshing;
+                            } else {
+                                window.reuse_paint(element_state.paint_range.clone());
+                            }
 
-                        let paint_end = window.paint_index();
-                        element_state.paint_range = paint_start..paint_end;
+                            let paint_end = window.paint_index();
+                            element_state.paint_range = paint_start..paint_end;
+                        });
 
                         ((), element_state)
                     },

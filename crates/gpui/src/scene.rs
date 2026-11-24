@@ -26,7 +26,12 @@ pub type DrawOrder = u32;
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
+    /// What was painted while recording, for [`Scene::replay`] in the next frame.
     pub(crate) paint_operations: Vec<PaintOperation>,
+    /// How many enclosing paints may be replayed next frame (a cached view's, the deferred
+    /// draws'). Outside them nothing replays a range, so no operation is kept: a canvas with
+    /// tens of thousands of quads would otherwise copy each one twice per frame.
+    recording: u32,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
@@ -63,16 +68,30 @@ impl Scene {
         self.paint_operations.len()
     }
 
+    /// Starts (`true`) or ends a paint whose operations are kept, nested.
+    pub(crate) fn set_recording(&mut self, on: bool) {
+        if on {
+            self.recording += 1;
+        } else {
+            self.recording -= 1;
+        }
+    }
+
+    fn record(&mut self, operation: impl FnOnce() -> PaintOperation) {
+        if self.recording > 0 {
+            self.paint_operations.push(operation());
+        }
+    }
+
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
-        self.paint_operations
-            .push(PaintOperation::StartLayer(bounds));
+        self.record(|| PaintOperation::StartLayer(bounds));
     }
 
     pub fn pop_layer(&mut self) {
         self.layer_stack.pop();
-        self.paint_operations.push(PaintOperation::EndLayer);
+        self.record(|| PaintOperation::EndLayer);
     }
 
     /// Raise the draw-order floor so every primitive inserted afterwards sorts above everything
@@ -170,8 +189,7 @@ impl Scene {
                 self.filter_boundaries.push(boundary.clone());
             }
         }
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+        self.record(|| PaintOperation::Primitive(primitive));
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
@@ -1243,5 +1261,36 @@ mod tests {
         scene.insert_primitive(quad());
 
         assert_eq!(batch_kinds(&mut scene), vec!["quad", "backdrop", "quad"]);
+    }
+
+    #[test]
+    fn only_recorded_paints_can_be_replayed() {
+        let mut previous = Scene::default();
+        previous.insert_primitive(quad());
+        assert_eq!(
+            previous.len(),
+            0,
+            "nothing replays a paint outside a recording"
+        );
+        assert_eq!(previous.quads.len(), 1);
+
+        previous.set_recording(true);
+        let start = previous.len();
+        previous.push_layer(full_bounds());
+        previous.insert_primitive(quad());
+        previous.insert_primitive(detached_quad());
+        previous.pop_layer();
+        let end = previous.len();
+        previous.set_recording(false);
+        previous.insert_primitive(quad());
+        assert_eq!(end - start, 4);
+        assert_eq!(previous.len(), end);
+
+        let mut next = Scene::default();
+        next.set_recording(true);
+        next.replay(start..end, &previous);
+        next.set_recording(false);
+        assert_eq!(next.quads.len(), 2);
+        assert_eq!(next.len(), 4, "a replayed range is recorded again");
     }
 }

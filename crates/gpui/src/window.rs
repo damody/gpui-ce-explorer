@@ -3010,21 +3010,24 @@ impl Window {
                 .dispatch_tree
                 .set_active_node(deferred_draw.parent_node);
 
-            let paint_start = self.paint_index();
-            let content_mask = deferred_draw.content_mask;
-            if let Some(element) = deferred_draw.element.as_mut() {
-                self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_content_mask(content_mask, |window| {
-                        window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                            element.paint(window, cx);
-                        });
+            // A cached view that reuses its prepaint next frame replays this range.
+            self.with_recorded_paint(|window| {
+                let paint_start = window.paint_index();
+                let content_mask = deferred_draw.content_mask;
+                if let Some(element) = deferred_draw.element.as_mut() {
+                    window.with_rendered_view(deferred_draw.current_view, |window| {
+                        window.with_content_mask(content_mask, |window| {
+                            window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                                element.paint(window, cx);
+                            });
+                        })
                     })
-                })
-            } else {
-                self.reuse_paint(deferred_draw.paint_range.clone());
-            }
-            let paint_end = self.paint_index();
-            deferred_draw.paint_range = paint_start..paint_end;
+                } else {
+                    window.reuse_paint(deferred_draw.paint_range.clone());
+                }
+                let paint_end = window.paint_index();
+                deferred_draw.paint_range = paint_start..paint_end;
+            });
         }
         self.next_frame.deferred_draws = deferred_draws;
         self.element_id_stack.clear();
@@ -3097,6 +3100,15 @@ impl Window {
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
         );
+    }
+
+    /// Paints with the scene keeping its operations, for a paint range replayed next frame
+    /// ([`Self::reuse_paint`]).
+    pub(crate) fn with_recorded_paint<R>(&mut self, paint: impl FnOnce(&mut Self) -> R) -> R {
+        self.next_frame.scene.set_recording(true);
+        let result = paint(self);
+        self.next_frame.scene.set_recording(false);
+        result
     }
 
     pub(crate) fn paint_index(&self) -> PaintIndex {
