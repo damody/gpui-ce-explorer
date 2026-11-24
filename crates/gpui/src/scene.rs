@@ -203,8 +203,14 @@ impl Scene {
     }
 
     pub fn finish(&mut self) {
+        self.finish_into(&mut Vec::new());
+    }
+
+    /// [`Self::finish`], sorting the quads through `spare` (a buffer whose contents are
+    /// dropped: the previous frame's quads, cleared right after).
+    pub(crate) fn finish_into(&mut self, spare: &mut Vec<Quad>) {
         self.shadows.sort_by_key(|shadow| shadow.order);
-        self.quads.sort_by_key(|quad| quad.order);
+        sort_by_order(&mut self.quads, spare, |quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
         self.monochrome_sprites
@@ -254,6 +260,41 @@ impl Scene {
             filter_boundaries_iter: self.filter_boundaries.iter().peekable(),
         }
     }
+}
+
+/// Sorts `items` by draw order exactly as a stable sort does (equal orders keep their
+/// insertion order), writing each item once. A canvas paints tens of thousands of quads of
+/// one or two orders between other content's lower orders; a merge sort moves those large
+/// primitives through a scratch buffer and back, a counting sort by order gathers them once
+/// into `spare` (which then holds the old buffer, cleared).
+fn sort_by_order<T: Copy>(items: &mut Vec<T>, spare: &mut Vec<T>, order: impl Fn(&T) -> DrawOrder) {
+    spare.clear();
+    if items.is_sorted_by_key(&order) {
+        return;
+    }
+    let max = items.iter().map(&order).max().unwrap_or_default() as usize;
+    if max / 4 >= items.len() {
+        // Orders too sparse for a counting array.
+        items.sort_by_key(order);
+        return;
+    }
+    // `next[order]`: the sorted position of the next item of that order.
+    let mut next = vec![0u32; max + 2];
+    for item in items.iter() {
+        next[order(item) as usize + 1] += 1;
+    }
+    for i in 1..next.len() {
+        next[i] += next[i - 1];
+    }
+    let mut sources = vec![0u32; items.len()];
+    for (index, item) in items.iter().enumerate() {
+        let slot = &mut next[order(item) as usize];
+        sources[*slot as usize] = index as u32;
+        *slot += 1;
+    }
+    spare.extend(sources.iter().map(|&index| items[index as usize]));
+    std::mem::swap(items, spare);
+    spare.clear();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
@@ -1292,5 +1333,40 @@ mod tests {
         next.set_recording(false);
         assert_eq!(next.quads.len(), 2);
         assert_eq!(next.len(), 4, "a replayed range is recorded again");
+    }
+
+    #[test]
+    fn sort_by_order_matches_a_stable_sort() {
+        // Runs of one order between lower orders (a canvas between other content), and
+        // orders too sparse for the counting array.
+        let mut seed = 7u32;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for case in 0..20 {
+            let items: Vec<(DrawOrder, usize)> = (0..2000)
+                .map(|index| {
+                    let order = match case % 3 {
+                        0 => random() % 8,
+                        1 if index % 500 < 400 => 40 + random() % 2,
+                        1 => random() % 40,
+                        _ => random() % 1_000_000,
+                    };
+                    (order, index)
+                })
+                .collect();
+            let mut expected = items.clone();
+            expected.sort_by_key(|item| item.0);
+            let (mut sorted, mut spare) = (items, vec![(0, 0); 3]);
+            sort_by_order(&mut sorted, &mut spare, |item| item.0);
+            assert_eq!(sorted, expected);
+            assert!(spare.is_empty());
+        }
+        let mut sorted = vec![(1, 0), (2, 1)];
+        sort_by_order(&mut sorted, &mut Vec::new(), |item| item.0);
+        assert_eq!(sorted, vec![(1, 0), (2, 1)]);
     }
 }

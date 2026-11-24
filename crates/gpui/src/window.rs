@@ -978,7 +978,8 @@ impl Frame {
             }
         }
 
-        self.scene.finish();
+        // The previous frame is cleared once this one replaces it.
+        self.scene.finish_into(&mut prev_frame.scene.quads);
     }
 }
 
